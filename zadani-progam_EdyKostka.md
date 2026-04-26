@@ -26,17 +26,11 @@ Pozadavek na signal: perioda 10s, Pulz jde do high a trva 400ms, potom signal kl
 * pripojeno na GPIO17
 Jedna se o periferii s OneWire LED  Inolux- IN-PI55TATPRPGPB . Je zde 12 kusu teto LED. 
 
-### Vstupy
-* Pripojeno na GPIO18 - GPIO22 
-* Vstup je default ve stavu - High. Detekovani stavu LOW znaci stisknuti/prepnuti spinace
-Vstupy jsou realizovane tlacitky a prepinaci. Je zde potreba mit lehky debouncing a reakce na stisknuti. 
-Reakce na stisknuti bude popsana nize. 
-
 ### LED 
 * LED - jsou rizene PWM vystupem. 
 pripojeno na 
- * pro GPIO 0,1,2,5,6,9,10,13,14,15 je stav LOW - LED zhasnuta, 
- * pro GPIO 3,4,7,8,11,12, je stav High - LED zhasnuta.
+ * pro GPIO 0,1,2,5,6,9,10,11,13,14,15 je stav LOW - LED zhasnuta, 
+ * pro GPIO 3,4,7,8,12, je stav High - LED zhasnuta.
 
 LED se budou delit do skupin dle ucelu:
 LED:
@@ -60,27 +54,31 @@ LED:
     * 1x GREEN
 
 
-LED
-
-|GPIO | off state| on state| group | place | collor|
+|GPIO | off state| group | place | collor| PWM MAX | PWM MIN |
 | ---| --- | --- | --- | --- | ---| 
-|0| | | JERAB | TOP| RED |
-|1| | | JERAB | TOP| YELLOW |
-|2| | | SEMAFOR | MID | ORANGE |
-|3| | | SEMAFOR | TOP | RED |
-|4| | | SEMAFOR | BOT | GREEN|
-|5| | | POZOR | LEFT | RED |
-|6| | | POZOR | RIGHT | RED |
-|7| | | BULDOZER | TOP | ORANGE |
-|8| | | MICHACKA | FRONT | YELLOW | 
-|9| | | JERAB | RIGHT | RED |
-|10| | | JERAB | CABIN | RED |
+|0| LOW | | JERAB | TOP| RED |
+|1| LOW | | JERAB | TOP| YELLOW |
+|2| LOW | | SEMAFOR | MID | ORANGE |
+|3| HIGH| | SEMAFOR | TOP | RED |
+|4| HIGH| | SEMAFOR | BOT | GREEN|
+|5| LOW | | POZOR | LEFT | RED |
+|6| LOW | | POZOR | RIGHT | RED |
+|7| HIGH| | BULDOZER | TOP | ORANGE |
+|8| HIGH| | MICHACKA | FRONT | YELLOW | 
+|9| LOW | | JERAB | RIGHT | RED |
+|10| LOW | | JERAB | CABIN | RED |
 |11| LOW | High| SWITCH | - | YELLOW |
-|12| | | STAVBA | TOP | WHITE|
-|13| | | JERAB | LEFT | RED |
-|14| | | JERAB | BOT | RED |
-|15| | | JERAB | MID | RED |
+|12| HIGH| | STAVBA | TOP | WHITE|
+|13| LOW | | JERAB | LEFT | RED |
+|14| LOW | | JERAB | BOT | RED |
+|15| LOW | | JERAB | MID | RED |
 
+
+### Vstupy
+* Pripojeno na GPIO18 - GPIO22 
+* Vstup je default ve stavu - High. Detekovani stavu LOW znaci stisknuti/prepnuti spinace
+Vstupy jsou realizovane tlacitky a prepinaci. Je zde potreba mit lehky debouncing a reakce na stisknuti. 
+Reakce na stisknuti bude popsana nize. 
 
 SWITCH
 numbered from left
