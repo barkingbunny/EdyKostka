@@ -58,7 +58,7 @@ LED:
 | ---| --- | --- | --- | --- | ---| 
 |0| LOW | | JERAB | TOP| RED |
 |1| LOW | | JERAB | TOP| YELLOW |
-|2| LOW | | SEMAFOR | MID | ORANGE |
+|2| LOW | | SEMAFOR | MID | YELLOW |
 |3| HIGH| | SEMAFOR | TOP | RED |
 |4| HIGH| | SEMAFOR | BOT | GREEN|
 |5| LOW | | POZOR | LEFT | RED |

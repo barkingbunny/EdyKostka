@@ -19,9 +19,21 @@ import sys
 import time
 
 LED_PINS = list(range(16))            # GPIO 0..15
-INVERTED_LEDS = {3, 4, 7, 8, 11, 12}  # HIGH = OFF
+INVERTED_LEDS = {3, 4, 7, 8, 12}      # HIGH = OFF
 INPUT_PINS = [18, 19, 20, 21, 22]
 DEBOUNCE_S = 0.03
+
+# Logicke skupiny LED dle zadani (poradi = poradi probliknuti pri bootu).
+# V ramci skupiny: od BOT nahoru, zprava doleva (dle sloupce 'place' v zadani).
+LED_GROUPS = (
+    ("POZOR",    (6, 5)),                       # RIGHT, LEFT
+    ("SEMAFOR",  (4, 2, 3)),                    # BOT(GREEN), MID(ORANGE), TOP(RED)
+    ("MICHACKA", (8,)),                         # FRONT
+    ("JERAB",    (14, 10, 15, 9, 13, 0, 1)),    # BOT, CABIN, MID, RIGHT, LEFT, TOP-RED, TOP-YELLOW
+    ("BULDOZER", (7,)),                         # TOP
+    ("SWITCH",   (11,)),
+    ("STAVBA",   (12,)),                        # TOP
+)
 
 HEX_DIGITS = "0123456789abcdef"
 
@@ -50,6 +62,21 @@ def set_led(n, on):
 
 for n in LED_PINS:
     set_led(n, False)
+
+
+# --- Init test: probliknuti LED po skupinach, v ramci skupiny LED po LED ---
+LED_TEST_ON_S = 0.4
+
+print("[INIT] Test LED po skupinach (LED po LED)...")
+time.sleep(0.5)  # kratka pauza, at je videt cisty start
+for name, pins in LED_GROUPS:
+    print("[INIT]   skupina {:8s} -> GPIO {}".format(name, list(pins)))
+    for n in pins:
+        set_led(n, True)
+        time.sleep(LED_TEST_ON_S)
+        set_led(n, False)
+print("[INIT] Test LED hotov - vsechny LED OFF.")
+
 
 # --- Input setup ---
 inputs = {}
