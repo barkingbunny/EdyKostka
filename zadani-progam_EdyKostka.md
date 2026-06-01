@@ -17,13 +17,13 @@ Mame 5 vstupu, kde 4 jsou Off-On spinace, a 1x Off-(ON) (tlacitko)
 |GPIO | Type | off state| group | place | collor| PWM MAX | PWM MIN | 
 | ---| --- | --- | --- | --- | ---| --- | 
 | 0| Output | LOW | | JERAB | TOP| RED* | 8 % | 
-| 1| Output | LOW | | JERAB | TOP| YELLOW* | 20 % | 
+| 1| Output | LOW | | JERAB | TOP| YELLOW* | 15 % | 
 | 2| Output | LOW | | SEMAFOR | MID | YELLOW | 100 % |
 | 3| Output | HIGH| | SEMAFOR | TOP | RED | 100 % |
 | 4| Output | HIGH| | SEMAFOR | BOT | GREEN| 100 % |
 | 5| Output | LOW | | POZOR | LEFT | RED | 100 % |
 | 6| Output | LOW | | POZOR | RIGHT | RED | 100 % |
-| 7| Output | HIGH| | BULDOZER | TOP | ORANGE | 50% | 
+| 7| Output | HIGH| | BULDOZER | TOP | ORANGE | 35% | 
 | 8| Output | HIGH| | MICHACKA | FRONT | YELLOW | 100 % | 
 | 9| Output | LOW | | JERAB | RIGHT | RED | 100 % |
 |10| Output |LOW | | JERAB | CABIN | RED | 100 % |
@@ -32,7 +32,7 @@ Mame 5 vstupu, kde 4 jsou Off-On spinace, a 1x Off-(ON) (tlacitko)
 |13| Output |LOW | | JERAB | LEFT | RED | 100 % |
 |14| Output |LOW | | JERAB | BOT | RED | 100 % |
 |15| Output |LOW | | JERAB | MID | RED | 100 % |
-|-| OneWire|-|-| AUTO | - | RGB | 8% |
+|-| OneWire|-|-| AUTO | - | RGB | 6% |
 
 poznamka: LED s oznacenim * nemohou fungovat zaroven. Muze fungovat jen jedna z techto dvou.
 
@@ -113,6 +113,13 @@ LED se deli do skupin dle ucelu:
 Vstupy jsou realizovane tlacitky a prepinaci. Je zde potreba mit lehky debouncing a reakce na stisknuti. 
 Reakce na stisknuti bude popsana nize. 
 
+### Buzzer
+* Pripojeno viz tabulka Sound (GPIO 28).
+* Jedna se o **aktivni buzzer** (s vestavenym oscilatorem). HIGH na vstupu = znelka, LOW = ticho. **Vyska tonu je pevna**, nelze ji menit. Melodie se proto skladaji **pouze z casovani pipu a pauz**, ne z noty.
+* Rizeni je pres jednoduchy **digitalni vystup** (`digitalio`, ne PWM). To je dulezite, protoze GP28 sdili PWM hardware (slice 6.A) s GP12 (STAVBA LED) — soubezne pouziti obou jako PWM neni mozne.
+* Prehravac je **neblokujici**: na pozadi tikajici state machine prochazi posloupnost kroku `(uroven: bool, doba_ms: int)`. Hlavni smycka pouze posouva stav podle `time.monotonic()`, takze zvuk neblokuje LED animace ani vstupy.
+* Pri prechodu do **sleepBoxu** je buzzer okamzite umlcen.
+
 
 # Zadani programu
 
@@ -164,7 +171,7 @@ USB reset). Žádná softwarová cesta zpět neexistuje.
 ## Inicializační test LED po nabootování
 Probliknout LED **po skupinách** v daném pořadí, v rámci skupiny
 **LED po LED** (ne všechny současně). Každá LED svítí po dobu
-`LED_TEST_ON_S` sekund (default 0.1 s), pak zhasne a hned se rozsvítí další.
+`LED_TEST_ON_S` sekund, pak zhasne a hned se rozsvítí další.
 Konstanta `LED_TEST_ON_S` je definovaná v `code.py` a lze ji ladit
 pro rychlejší/pomalejší test. 
 
@@ -184,8 +191,12 @@ pro rychlejší/pomalejší test.
 Projet postupne LED na 1-wire sbernici. barva bude zelena, intenzita 0.1, postupne od prvni po posledni. vzdy se led rozsviti a zhasne. Po te se rozsviti druhe led. 
 
 ## REPL režim (po init testu)
-Příkazy přes serial, potvrzované **Enterem** (CR/LF, případně mezera/tab).
-Znaky se při psaní viditelně echují zpět, Backspace maže poslední znak.
+**Hybridní vstupní režim:**
+* **Jednoznakové „instant" příkazy** se vyhodnotí **okamžitě** bez Enteru (typing-friendly pro rychlé toggle LED).
+* **Víceznakové příkazy** se zadávají do bufferu a potvrdí se **Enterem** (CR/LF, případně mezera/tab). Znaky se při psaní echují zpět, Backspace maže poslední znak.
+* Pokud první stisknutý znak začíná víceznakový příkaz (`W`, `D`, `F`, `P`), automaticky se vstoupí do bufferu — instantní akce se v tu chvíli nespustí, čeká se na zbytek + Enter. Backspace na prázdný buffer vrací do single-char módu.
+
+### Instantní příkazy (bez Enteru)
 
 | Příkaz           | Akce                                                                 |
 | ---------------- | -------------------------------------------------------------------- |
@@ -193,20 +204,25 @@ Znaky se při psaní viditelně echují zpět, Backspace maže poslední znak.
 | `A`              | všechny LED ON                                                       |
 | `Z`              | všechny LED OFF                                                      |
 | `S`              | výpis svítících LED                                                  |
-| `W`              | zapnout keep-a-live signál                                           |
-| `Woff`           | vypnout keep-a-live signál                                           |
-| `N`              | opakovat 1-wire LED test (R/G/B smoke + sekvence)                    |
+| `N`              | opakovat 1-wire LED test                                             |
 | `B`              | toggle MajakBuldozer                                                 |
 | `X`              | obnovit PozorStavba (po manuálním toggle LED 5/6)                    |
-| `D`              | výpis aktuální duty (zda je všude stejná)                            |
-| `D<n>`           | nastavit PWM duty 0–100 % pro **všechny** LED (každá clamped na své PWM_MAX) |
-| `P`              | výpis duty + PWM_MAX všech LED                                       |
-| `P<hex>=<n>`     | nastavit PWM duty pro **jednu** LED a zapnout ji (např. `Pa=30` → LED 10 na 30 %); clamped na PWM_MAX_PCT[n] |
 | `+` / `-`        | ±5 % krok duty na poslední LED z příkazu `P<hex>=<n>`                |
+| `?`              | nápověda                                                             |
+
+### Buffer + Enter příkazy
+
+| Příkaz           | Akce                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| `W`              | zapnout keep-a-live signál                                           |
+| `Woff`           | vypnout keep-a-live signál                                           |
+| `D`              | výpis aktuální duty                                                  |
+| `D<n>`           | nastavit PWM duty 0–100 % pro **všechny** LED (každá clamped na své PWM_MAX) |
 | `F`              | výpis aktuální PWM frekvence                                         |
 | `F<n>`           | nastavit PWM frekvenci v Hz (sdílená všemi LED, např. `F1000`)       |
-| `FactoryRESET`   | nastavit default hodnoty                                             |
-| `?`              | nápověda                                                             |
+| `P`              | výpis duty + PWM_MAX všech LED                                       |
+| `P<hex>=<n>`     | nastavit PWM duty pro **jednu** LED a zapnout ji (např. `Pa=30` → LED 10 na 30 %); clamped na PWM_MAX_PCT[n] |
+| `FactoryRESET`   | default hodnoty + zápis do NVM                                       |
 
 * pro sekvenci A vem v potaz poznamku pod tabulkou LED. Dva vystupy LED nemohou byt zapnute zaroven, tam to udelej, ze problikava s periodou 1s
 * manuální toggle LED ve skupině POZOR (`5` nebo `6`) pauzuje funkci *PozorStavba* — obnovení příkazem `X`
@@ -224,6 +240,26 @@ PWM hodnoty pro kazdou LED se budou ukladat do lokalni pameti, aby se daly vyvol
 
 - PWM řízení LED bude udelano pro kazdou led. Nastaveni bude mozno udelat pro kazdou LED zvlast, aby se dala odladit jeji intenzita. Pri zadavani pres CMD prosim viditelne vypisovat znaky, abych videl co pisi. Po nastaveni intenzity u LED automaticky ji zapnout. 
 
+### Persistence PWM (NVM)
+
+PWM hodnoty (per-LED duty + sdilena frekvence) se ukladaji do **NVM** (`microcontroller.nvm`) — vyhrazeny ~4 KB blok flash primo v procesoru, mimo USB-viditelny filesystem CIRCUITPY. Vyhody: zapis z `code.py` nevyzaduje `storage.remount` a tedy nebrani PC editovat kod; konfigurace je oddelena od kodu; pro 16 LED + frekvenci staci ~20 B.
+
+**Layout NVM (offsety v bytech):**
+
+| Offset | Velikost | Pole               | Popis                                                |
+| ------ | -------- | ------------------ | ---------------------------------------------------- |
+| 0      | 1 B      | magic              | `0xA5` = data v NVM jsou platna, jinak fallback na defaults |
+| 1      | 1 B      | verze layoutu      | `0x01` (pri zmene struktury inkrementovat)           |
+| 2-3    | 2 B      | PWM frekvence (Hz) | uint16 little-endian, default `500`                  |
+| 4-19   | 16 B     | duty per LED       | uint8 per LED (GPIO 0..15), procenta 0..100          |
+
+**Chovani:**
+* **Pri bootu** se cte byte 0. Pokud neni `0xA5`, pouziji se defaults z `LED-Table` (PWM MAX) + frekvence `500 Hz` a hned se zapisi do NVM (vznikne magic).
+* **Pri zmene** PWM (prikazy `P<hex>=<n>`, `D<n>`, `F<n>`, `+`/`-` v REPL) se zapise cely blok do NVM.
+* **`FactoryRESET`** prepise NVM defaultnimi hodnotami z `LED-Table`.
+* **Clamp:** duty kazde LED je clamped na `PWM_MAX_PCT[n]` z `LED-Table`. Pokud by NVM obsahovala vetsi hodnotu (napr. po snizeni MAX v kodu), pri loadu se ztisi na MAX.
+* **Pri preflashovani CircuitPythonu** (UF2) se NVM **vymaze** — pri prvnim bootu po flashi se nactou defaults a zapisi se. Toto je ocekavane chovani.
+
 
 
 # Samotny program - HRA
@@ -237,14 +273,24 @@ table
 | 2 | RozsvitJerab |
 | 3 | RozsvitStavbu |
 | 4 | PustAuto |
-| 5 |  --rozsviti vsechny LED, ktere jsou k dispozici.-- |
+| 5 |  --rozsviti vsechny LED, ktere jsou k dispozici. a drzi rozsvicene dokud je sepnuto-- |
 
 pri sepnuti daneho tlacitka se spusti akce. Reaguje se na nabeznou hranu. Pokud se tlacitko vypne, tak se deaktivuje i dana funkce a vrati vse zpet jak bylo predtim. Jedinou vyjimkou je tlacitko 4, ktere je pouze na stisk. Tam funkce dobehne dokonce. 
 
 Tlacitka a funkce jsou na sobe nezavisle, muze bezet soucasne vice funkci. 
 
 ## Svetlo tlacitko 
-*vabeniKoristi* funkce - svetlo pro *TLACITKO*  se spusti asi 5s po nabehnuti do programu HRA. LED lehce vabi, aby si ho nekdo vsiml. Jeho intenzita je zmensena na 50 % z PWM_MAX dané LED a postupne pulzuje, aby privabyl k sobe pozornost. Pulzuje jako klidne buseni srdce. 
+*vabeniKoristi* funkce - svetlo pro *TLACITKO*  se spusti asi 5s po nabehnuti do programu HRA (`VABENI_BOOT_DELAY_S`). LED lehce vabi, aby si ho nekdo vsiml. Jeho intenzita je zmensena na 50 % z PWM_MAX dané LED a postupne pulzuje, aby privabyl k sobe pozornost. Pulzuje jako klidne buseni srdce.
+
+Konkretni chovani pulzu (buseni srdce):
+
+- Tempo `VABENI_BPM = 15` tepu za minutu. Z toho se odvozuje perioda jednoho tepu `VABENI_PERIOD_S = 60 / VABENI_BPM` (tedy 4 s).
+- Jeden tep ma dve casti: **rozsvicenou** a **ztmavenou**.
+- **Rozsvicena cast** zabira zbytek periody (perioda minus tma, tj. asi 3,7 s). Jas plynule nabiha az na maximum a zase plynule dobiha zpet na nulu - hladky fade-in i fade-out. Tvarem je to pulvlna sinusu `sin(0..pi)` (0 -> 1 -> 0).
+- **Ztmavena cast** je pevne `VABENI_DARK_S = 0.300` (max 300 ms) na konci kazde periody, kdy LED uplne zhasne. Slouzi jako vizualni oddelovac jednotlivych tepu. Tato hodnota je pevna a nemeni se s tempem - pri zmene `VABENI_BPM` se prizpusobuje jen delka rozsvicene casti.
+- Na vypocteny jas (0..1) se aplikuje **gamma korekce** `VABENI_GAMMA = 2.2` (umocneni), protoze lidske oko vnima jas nelinearne - bez ni by nabeh pusobil prilis rychle nahore a useknute dole.
+- Vysledny jas se nakonec skaluje na **50 % z PWM_MAX** dane LED (specifikum vabeniKoristi).
+- Funkce je neblokujici (rizena casem v hlavni smycce), aby soubezne mohly bezet ostatni HRA funkce, keep-alive i REPL.
 
 ## Pozor Stavba
 *PozorStavba* funkce bezi automaticky po nabootovani systemu. Funkce blika dvemi LED ve stylu Pozor semaforu, ktery dava najevo nebezpeci. Tedy blika cervenymi led ve skupine POZOR
@@ -254,6 +300,15 @@ Funkce *MajakBuldozer* bude pulzovat pomoci zmeny Duty v PWM vystupu. Melo by to
 
 ## STAVBA
 *RozsvitStavbu* funkce udela, ze rozsviti LED STABA a zaroven rozsviti LED MICHACKA. LED STAVBA se bude rozsvicet postupne. Aby se to lidkemu oku zdalo byt jako postupne nabihani sodikove vybojky.
+
+**Vypnuti (uvolneni SW3) je zrcadlove:**
+* MICHACKA zhasne okamzite (binarni on/off).
+* STAVBA **plynule zhasina** stejnou krivkou v opacnem smeru — doba zhasinani `STAVBA_FADE_OUT_S` (default stejna jako fade-in, tj. 2.5 s).
+* Pri opakovanem stisku/uvolneni SW3 behem prechodu se faze prelozi a pokracuje **plynule z aktualni urovne jasu** (zadny vizualni skok dolu/nahoru).
+
+Aplikuje se krivka `pct = frac^2 * PWM_MAX` (kvadraticka ease-in pri rozsvecovani, zrcadleno pri zhasinani). Tim se zachova pocit "sodikove vybojky" v obou smerech.
+
+**SleepBox / stop_all_hra**: STAVBA se vypne okamzite (bez fade-out), MICHACKA stejne tak.
 
 ## JERAB
 *RozsvitJerab* funkce rozsviti Jerab. Led se postupne zapnou, stejnou sekvenci jaka je v Init, s vynechanim Zlute LED. Prodleva je `JERAB_INIT_DELAY_MS` mezi LED. 
@@ -274,6 +329,21 @@ CASOVANI:
 * samotne trvani dane faze se lisi, zavisi na narocnosti kroku provadenych v dane fazi. 
 
 pri zapnuti SEMAFOR se funkce vabeniKoristi deaktivuje. 
+
+### Zvuk startu PustAuto
+
+Soucasne s prechodem do faze **INIT** (tedy v okamziku skutecneho startu sekvence) odstartuje buzzer **acknowledge znelku „PIIIIP"** — jedno sustained pipnuti:
+
+| Krok | Uroven   | Doba    |
+| ---- | -------- | ------- |
+| 1    | HIGH (zni) | 280 ms |
+
+**Implementacni pravidla:**
+* Volani znelky **musi byt uvnitr `sem_start()`** (nebo ekvivalentu) **az za guardem** kontrolujicim `sem_state == IDLE`. Tim se zaridi, ze opakovany stisk SW4 v prubehu jiz bezici sekvence:
+  * nerestartuje sekvenci (existujici chovani),
+  * **a take neprehraje znovu znelku** — system je behem behu PustAuto „akusticky immune" na dalsi stisky.
+* Znelka je neblokujici (state machine), takze nezdrzuje rozsvitovani LED na semaforu ani 1. OneWire bile LED ve fazi INIT.
+* Znelka se neopakuje pri prechodech mezi vnitrnimi fazemi PustAuto (INIT → RUN_SEMAFOR → GO → ODJETO → END) — zazni pouze jednou na zacatku celeho cyklu.
 
 ### faze Init
 sviti cervena LED na Semaforu, Sviti 1.OneWire LED z retezu One Wire Bilou barvou a sviti stale , dokud se nestane neco dle navodu.
@@ -298,6 +368,8 @@ jsou definovány v `code.py` na začátku souboru.
 | `SLEEP_BOX_TIMEOUT_S`  | 600     | s        | nečinnost vstupů → přechod do sleepBox      |
 | `SHUTDOWN_TIMEOUT_S`   | 600     | s        | doba v sleepBox → vypnutí keep-a-live       |
 | `JERAB_INIT_DELAY_MS`  | 100     | ms       | Delay pri zapinani LED u Jerabu pri zapnuti|
+| `STAVBA_FADE_IN_S`     | 2.5     | s        | doba rozsvecovani STAVBA (sodikova vybojka) |
+| `STAVBA_FADE_OUT_S`    | 2.5     | s        | doba zhasinani STAVBA (zrcadlovy fade-out)  |
 
 
 

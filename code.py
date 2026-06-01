@@ -1,53 +1,134 @@
 """
-EdyKostka - HRA + bring-up nastroj.
+EdyKostka - hlavni program.
 
-HRA (po bootu bezi automaticky):
-  - keep-alive: perioda 10 s, pulz HIGH 400 ms (bezi na pozadi)
-  - PozorStavba: alternujici blikani GPIO 5 / 6 (varovny semafor)
-SWITCHE (aktivni LOW, reaguji na hrany):
-  SW1 (GPIO 18) -> MajakBuldozer    (start/stop)
-  SW2 (GPIO 19) -> RozsvitJerab     (start/stop)
-  SW3 (GPIO 22) -> RozsvitStavbu    (start/stop)
-  SW4 (GPIO 20) -> PustAuto         (momentova OFF-(ON); funkce dobehne dokonce)
-  SW5 (GPIO 21) -> vsechny LED ON   (OFF-ON)
+Strukturovano podle zadani:
+  * 16 PWM LED (GPIO 0..15) s individualni duty, sdilenou frekvenci
+  * PWM hodnoty persistovane v microcontroller.nvm
+  * 1-wire LED (12x WS2812 / Inolux IN-PI55) na GP17
+  * Keep-alive na GP16 (perioda 10 s, pulz 400 ms) - bezi v pozadi od bootu
+  * Onboard LED zrcadli stav keep-alive (DEBUG)
+  * 5 vstupu (GP18..22) - debounced, mapovany na HRA funkce
+  * REPL pres serial - prikazy potvrzovane Enterem, echo, Backspace
+  * HRA funkce: PozorStavba (auto), vabeniKoristi, MajakBuldozer,
+                RozsvitJerab, RozsvitStavbu, PustAuto (SEMAFOR)
+  * sleepBox + ShutDown casovace
 
-AUTO funkce na pozadi:
-  - vabeniKoristi: pulzuje GPIO 11 na 50 %, start ~5 s po nabehnuti HRA.
-    Pri startu PustAuto se vypne, po END PustAuto se znovu zapne.
-
-REPL (serial, bez Enteru):
-  0..9 a..f  - toggle LED GPIO 0..15 (hex; 5/6 pauzuje PozorStavba)
-  A / Z      - vsechny ON / vsechny OFF
-  S          - stav LED
-  X          - obnovit PozorStavba po manualnim toggle 5/6
-  W / Woff   - keep-alive ON / OFF
-  N          - opakovat 1-wire LED test
-  B          - toggle MajakBuldozer
-  D<n>       - duty pro vsechny LED (clamped na PWM_MAX z tabulky)
-  P<hex>=<n> - duty pro jednu LED + zapnout
-  + / -      - 5% krok na posledni 'P' LED
-  P          - vypis duty + PWM_MAX vsech LED
-  F<n>       - PWM frekvence
-  ?          - help
-
-PWM MAX (tabulka v zadani): kazda LED ma per-pin limit, hardware nikdy
-nedostane vyssi duty (clamping v _clamp_pct + _duty_value).
+REPL napoveda - viz prikaz '?'.
 """
 
 import board
 import digitalio
-import math
 import pwmio
 import supervisor
 import sys
 import time
+import math
+import microcontroller
+import neopixel
 
-# --- nejdrive pockame na pripojeni seriaku, at uzivatel uvidi i prvni vypisy ---
-# (CircuitPython prvni vypisy jinak zahodi, kdyz host jeste neotevrel COM port)
+# ====================================================================
+# KONSTANTY
+# ====================================================================
+LED_PINS = list(range(16))
+INVERTED_LEDS = {3, 4, 7, 8, 12}        # HIGH = OFF
+INPUT_PINS = [18, 19, 20, 21, 22]
+KEEP_ALIVE_PIN = 16
+ONEWIRE_PIN = 17
+N_ONEWIRE_PIXELS = 12
+BUZZER_PIN = 28                          # jen digital out - test pip
+
+# Mapovani SWITCH -> GPIO (numerace dle zadani)
+SW1_PIN = 18  # YELLOW  OFF-ON  -> MajakBuldozer
+SW2_PIN = 19  # YELLOW  OFF-ON  -> RozsvitJerab
+SW3_PIN = 22  # GREY    OFF-ON  -> RozsvitStavbu
+SW4_PIN = 20  # GREEN   OFF-(ON) tlacitko -> PustAuto (dobehne)
+SW5_PIN = 21  # RED     OFF-ON  -> vsechny LED ON (drzi)
+
+# PWM defaults per LED z LED-Table
+PWM_FREQ_DEFAULT = 500
+PWM_FREQ_MIN = 1
+PWM_FREQ_MAX = 200000
+PWM_MAX_PCT = {
+    0: 8,    1: 20,   2: 100,  3: 100,
+    4: 100,  5: 100,  6: 100,  7: 40,
+    8: 100,  9: 100, 10: 100, 11: 100,
+   12: 40,  13: 100, 14: 100, 15: 100,
+}
+
+EXCLUSIVE_PAIR = (0, 1)
+ALT_PERIOD_S = 1.0
+
+# LED-Table odvozene skupiny
+LED_GROUPS_INIT = (
+    ("POZOR",    (5, 6)),
+    ("SEMAFOR",  (4, 2, 3)),
+    ("MICHACKA", (8,)),
+    ("STAVBA",   (12,)),
+    ("JERAB",    (14, 15, 10, 0, 9, 13, 1)),
+    ("BULDOZER", (7,)),
+    ("TLACITKO", (11,)),
+)
+JERAB_PINS = (14, 15, 10, 0, 9, 13, 1)
+JERAB_PINS_NO_YELLOW = (14, 15, 10, 0, 9, 13)   # bez GPIO 1 (yellow)
+JERAB_YELLOW = 1
+SEMAFOR_RED, SEMAFOR_YELLOW, SEMAFOR_GREEN = 3, 2, 4
+POZOR_PINS = (5, 6)
+TLACITKO_PIN = 11
+BULDOZER_PIN = 7
+STAVBA_PIN = 12
+MICHACKA_PIN = 8
+
+HEX_DIGITS = "0123456789abcdef"
+
+# Casove konstanty (viz zadani: Tabulka s konstantami)
+LED_TEST_ON_S = 0.15
+SLEEP_BOX_TIMEOUT_S = 600.0
+SHUTDOWN_TIMEOUT_S = 600.0
+JERAB_INIT_DELAY_MS = 100
+VABENI_BOOT_DELAY_S = 5.0
+KA_PERIOD_S = 10.0
+KA_PULSE_S = 0.4
+DEBOUNCE_S = 0.03
+
+# HRA - tunable
+POZOR_BLINK_S = 0.5            # POZOR LED 5/6 blikani period (half-period)
+VABENI_BPM = 15                # vabeniKoristi - tepu za minutu (pomale buseni srdce)
+VABENI_PERIOD_S = 60.0 / VABENI_BPM   # delka jednoho tepu v sekundach
+VABENI_DARK_S = 0.300          # ztmavena cast mezi tepy (max 300 ms)
+VABENI_GAMMA = 2.2             # gamma korekce - oko vnima jas nelinearne
+MAJAK_PERIOD_S = 2.0           # MajakBuldozer perioda - jeden prulet majaku
+MAJAK_SHAPE_POW = 4            # sin^N - vetsi N = uzsi peak (vic "maják")
+STAVBA_FADE_IN_S = 2.5         # sodikova vybojka - doba nabihani
+STAVBA_FADE_OUT_S = 2.5        # zrcadlove fade-out (vypinani)
+JERAB_YELLOW_START_DELAY_S = 4.0
+JERAB_YELLOW_ON_S = 0.3        # 300 ms
+JERAB_RED_ON_S = 3.0           # 3 s
+# SEMAFOR - PustAuto
+SEM_INIT_HOLD_S = 3.0
+SEM_RUN_RED_TO_YELLOW_S = 2.5  # cervena dosviti
+SEM_RUN_YELLOW_S = 1.2         # zluta
+SEM_RUN_GREEN_HOLD_S = 1.0     # pak prejde GO
+SEM_GO_TO_ODJETO_S = 3.0
+SEM_ODJETO_GREEN_HOLD_S = 1.0
+SEM_ODJETO_YELLOW_S = 1.2
+SEM_ODJETO_TO_END_S = 3.0      # uvedeno v zadani jako prodleva ODJETO->END
+
+# NVM layout
+NVM_MAGIC = 0xA5
+NVM_VERSION = 0x01
+NVM_SIZE = 20  # 0:magic 1:ver 2-3:freq 4-19:duty per LED
+
+# OneWire
+ONEWIRE_BRIGHTNESS = 0.06
+
+
+# ====================================================================
+# BOOT: pockame na serial (max 3 s)
+# ====================================================================
 _t0 = time.monotonic()
 while not supervisor.runtime.serial_connected:
     if time.monotonic() - _t0 > 3.0:
-        break  # po 3 s pojedeme dal i bez seriaku
+        break
     time.sleep(0.05)
 
 print()
@@ -56,136 +137,99 @@ print("[BOOT] EdyKostka start")
 print("[BOOT] CircuitPython bezi, seriak pripojen.")
 print("=" * 50)
 
-print("[BOOT] import knihoven...")
-import neopixel  # noqa: E402
-print("[BOOT] import OK (board, digitalio, neopixel, supervisor, sys, time)")
-
-LED_PINS = list(range(16))            # GPIO 0..15
-INVERTED_LEDS = {3, 4, 7, 8, 12}      # HIGH = OFF
-INPUT_PINS = [18, 19, 20, 21, 22]
-KEEP_ALIVE_PIN = 16
-ONEWIRE_PIN = 17
-N_ONEWIRE_PIXELS = 12
-
-# HRA - mapovani switchu (zadani sekce HRA):
-SW1_BULDOZER_PIN = 18       # SWITCH 1 - MajakBuldozer
-SW2_JERAB_PIN = 19          # SWITCH 2 - RozsvitJerab
-SW3_STAVBA_PIN = 22         # SWITCH 3 - RozsvitStavbu (STAVBA + MICHACKA)
-SW4_AUTO_PIN = 20           # SWITCH 4 - PustAuto (momentova, OFF-(ON), funkce dobehne dokonce)
-SW5_ALL_PIN = 21            # SWITCH 5 - vsechny LED (OFF-ON, dosavadni 'A' chovani)
-
-# GPIO LED pro skupiny pouzite ve spinacove logice
-JERAB_PINS = (14, 15, 10, 0, 9, 13, 1)
-JERAB_NONEXCLUSIVE = tuple(n for n in JERAB_PINS if n not in (0, 1))
-JERAB_STEP_S = 0.1                       # 100 ms krok mezi rozsvecenim JERAB LED
-JERAB_TOP_BLINK_DELAY_S = 4.0            # po 4 s zacne TOP blikat
-JERAB_TOP_RED_S = 3.0                    # 3 s sviti RED (GPIO 0)
-JERAB_TOP_YELLOW_S = 0.3                 # 300 ms sviti YELLOW (GPIO 1)
-SEMAFOR_SEQUENCE = (3, 2, 4)             # RED -> YELLOW -> GREEN (drzeno pro init test)
-SEMAFOR_STEP_S = 0.4
-POZOR_PINS = (5, 6)                      # POZOR LEFT/RIGHT
-POZOR_HALF_PERIOD_S = 0.5                # 500 ms stridani 5 <-> 6
-STAVBA_LED_PIN = 12                      # STAVBA TOP (WHITE)
-MICHACKA_LED_PIN = 8                     # MICHACKA FRONT (YELLOW)
-# vabeniKoristi - svetlo TLACITKO (GPIO 11), pulzuje aby privabilo pozornost
-VABENI_LED_PIN = 11
-VABENI_MAX_PCT = 50                      # 50 % maxima (dle zadani)
-VABENI_PERIOD_S = 2.5                    # pomalejsi pulzovani nez buldozer
-VABENI_BOOT_DELAY_S = 5.0                # auto-start ~5 s po nabehnuti HRA
-VABENI_POST_AUTO_DELAY_S = 4.0           # prodleva ~4 s po PustAuto END (dle zadani)
-
-DEBOUNCE_S = 0.03
-KA_PERIOD_S = 10.0
-
-# sleepBox / ShutDown - dle sekce "System" v zadani.
-# Default 600 s (10 min). Pro testovani lze ladit na kratsi hodnoty.
-SLEEP_BOX_TIMEOUT_S = 600.0   # necinnost vstupu pred prechodem do sleepBox
-SHUTDOWN_TIMEOUT_S = 600.0    # doba v sleepBox pred trvalym vypnutim
-
-# --- PWM MAX limity pro jednotlive LED (z tabulky v zadani) ---
-# Zaruceno: hardware nikdy nedostane vyssi duty nez tato hodnota.
-PWM_MAX_PCT = {
-    0: 8,     # JERAB TOP   RED*    (8 %)
-    1: 20,    # JERAB TOP   YELLOW* (20 %)
-    2: 100,   # SEMAFOR MID YELLOW  (100 %)
-    3: 100,   # SEMAFOR TOP RED
-    4: 100,   # SEMAFOR BOT GREEN
-    5: 100,   # POZOR LEFT  RED
-    6: 100,   # POZOR RIGHT RED
-    7: 50,    # BULDOZER TOP ORANGE (50 %)
-    8: 100,   # MICHACKA FRONT YELLOW
-    9: 100,   # JERAB RIGHT RED
-    10: 100,  # JERAB CABIN RED
-    11: 100,  # SWITCH YELLOW
-    12: 40,   # STAVBA TOP WHITE (40 %)
-    13: 100,  # JERAB LEFT  RED
-    14: 100,  # JERAB BOT   RED
-    15: 100,  # JERAB MID   RED
-}
-
-# --- PWM nastaveni LED ---
-PWM_FREQ_MIN = 8            # Hz - prakticka spodni hranice pwmio na RP2040
-PWM_FREQ_MAX = 200000       # Hz - rozumny strop pro LED testovani (nad slyshitelnym pasmem)
-PWM_FREQ_DEFAULT = PWM_FREQ_MAX   # bootujeme rovnou na max - vc. init testu
-PWM_DUTY_DEFAULT = 100      # % (0..100)
-
-KA_PULSE_S = 0.4
-
-# GPIO 0 (RED*) a GPIO 1 (YELLOW*) v JERAB-TOP nemohou svitit zaroven.
-# Pri prikazu "A" budou alternovat s touto periodou.
-EXCLUSIVE_PAIR = (0, 1)
-ALT_PERIOD_S = 1.0
-
-# Logicke skupiny LED dle zadani (poradi = poradi probliknuti pri bootu).
-# V ramci skupiny: od BOT nahoru, zprava doleva (dle sloupce 'place' v zadani).
-LED_GROUPS = (
-    ("POZOR",    (5, 6)),                       # GPIO poradi dle zadani
-    ("SEMAFOR",  (4, 2, 3)),                    # BOT(GREEN), MID(YELLOW), TOP(RED)
-    ("MICHACKA", (8,)),                         # FRONT
-    ("STAVBA",   (12,)),                        # TOP
-    ("JERAB",    (14, 15, 10, 0, 9, 13, 1)),    # BOT, MID, CABIN, TOP-RED, RIGHT, LEFT, TOP-YELLOW
-    ("BULDOZER", (7,)),                         # TOP
-    ("SWITCH",   (11,)),
-)
-
-HEX_DIGITS = "0123456789abcdef"
-
 
 def gp(n):
     return getattr(board, "GP{}".format(n))
 
 
-# --- LED setup (PWM) ---
-print("[INIT] konfigurace 16 PWM LED na GPIO 0..15...")
+# ====================================================================
+# NVM - load/save PWM state
+# ====================================================================
+def nvm_defaults():
+    """Defaults z LED-Table: PWM_MAX_PCT pro kazdou LED, freq=500."""
+    duty = [PWM_MAX_PCT[n] for n in LED_PINS]
+    return PWM_FREQ_DEFAULT, duty
+
+
+def nvm_load():
+    """Vrati (freq, duty[16]). Pri nevalidni NVM zapise a vrati defaults."""
+    try:
+        buf = bytes(microcontroller.nvm[0:NVM_SIZE])
+    except Exception as e:
+        print("[NVM] cteni selhalo ({}), pouziji defaults".format(e))
+        f, d = nvm_defaults()
+        return f, d
+    if buf[0] != NVM_MAGIC or buf[1] != NVM_VERSION:
+        print("[NVM] magic/verze chybi (0x{:02X}/0x{:02X}) -> zapis defaults".format(buf[0], buf[1]))
+        f, d = nvm_defaults()
+        nvm_save(f, d)
+        return f, d
+    freq = buf[2] | (buf[3] << 8)
+    duty = [buf[4 + n] for n in LED_PINS]
+    # Clamp na PWM_MAX_PCT - kdyby v NVM byla starsi vyssi hodnota
+    duty = [min(duty[n], PWM_MAX_PCT[n]) for n in LED_PINS]
+    if freq < PWM_FREQ_MIN or freq > PWM_FREQ_MAX:
+        freq = PWM_FREQ_DEFAULT
+    print("[NVM] nactena konfigurace: freq={} Hz, duty={}".format(freq, duty))
+    return freq, duty
+
+
+def nvm_save(freq, duty):
+    buf = bytearray(NVM_SIZE)
+    buf[0] = NVM_MAGIC
+    buf[1] = NVM_VERSION
+    buf[2] = freq & 0xFF
+    buf[3] = (freq >> 8) & 0xFF
+    for n in LED_PINS:
+        v = duty[n]
+        if v < 0:
+            v = 0
+        if v > 100:
+            v = 100
+        buf[4 + n] = v
+    try:
+        microcontroller.nvm[0:NVM_SIZE] = bytes(buf)
+    except Exception as e:
+        print("[NVM] zapis selhal: {}".format(e))
+
+
+# ====================================================================
+# PWM LED
+# ====================================================================
+pwm_freq, led_duty_pct = nvm_load()
+led_on = {n: False for n in LED_PINS}
 leds = {}
-led_on = {}
-led_duty_pct = {}   # per-LED duty 0..100 %; frekvence je spolecna (pwm_freq)
-pwm_freq = PWM_FREQ_DEFAULT
 
-
-def _duty_value(n):
-    """Aktualni 'svitici' duty v 0..65535 pro LED n podle led_duty_pct[n]."""
-    return int(65535 * led_duty_pct[n] / 100)
+print("[INIT] PWM LED na GPIO 0..15, freq={} Hz, invertovane (HIGH=OFF): {}".format(
+    pwm_freq, sorted(INVERTED_LEDS)))
 
 
 def apply_led(n):
-    """Zapis duty_cycle na hardware podle led_on[n] a led_duty_pct[n] (s ohledem na invertovane LED)."""
-    d = _duty_value(n) if led_on[n] else 0
+    """Zapis duty_cycle na hardware podle led_on[n] a led_duty_pct[n]."""
+    pct = led_duty_pct[n] if led_on[n] else 0
+    raw = int(65535 * pct / 100)
     if n in INVERTED_LEDS:
-        d = 65535 - d
-    leds[n].duty_cycle = d
+        raw = 65535 - raw
+    leds[n].duty_cycle = raw
+
+
+def apply_led_with_duty(n, pct):
+    """Aplikuj LED s konkretnim duty (pro PWM animace - vabeniKoristi, MajakBuldozer)."""
+    # Clamp na PWM_MAX_PCT[n]
+    if pct > PWM_MAX_PCT[n]:
+        pct = PWM_MAX_PCT[n]
+    if pct < 0:
+        pct = 0
+    raw = int(65535 * pct / 100)
+    if n in INVERTED_LEDS:
+        raw = 65535 - raw
+    leds[n].duty_cycle = raw
 
 
 for n in LED_PINS:
     pwm = pwmio.PWMOut(gp(n), frequency=pwm_freq, duty_cycle=0, variable_frequency=False)
     leds[n] = pwm
-    led_on[n] = False
-    # Default duty per-LED = jeji PWM MAX z tabulky (HW limit). Uzivatel muze
-    # snizit pres 'P', ale nezvedne nad PWM_MAX_PCT[n].
-    led_duty_pct[n] = PWM_MAX_PCT[n]
     apply_led(n)
-print("[INIT]   PWM LED OK. freq={} Hz, per-LED duty=PWM_MAX (viz tabulka), invertovane (HIGH=OFF): {}".format(
-    pwm_freq, sorted(INVERTED_LEDS)))
 
 
 def set_led(n, on):
@@ -198,133 +242,94 @@ def reapply_all_leds():
         apply_led(n)
 
 
-def _clamp_pct(pct, n=None):
-    """Clampuje duty do 0..100 a pokud je `n` zadane, zaroven do 0..PWM_MAX_PCT[n]."""
-    if pct < 0:
-        return 0
-    cap = 100 if n is None else PWM_MAX_PCT.get(n, 100)
-    if pct > cap:
-        return cap
-    return pct
-
-
-def set_pwm_duty_all(pct):
-    """Bulk: nastavi duty vsem 16 LED (kazda se zvlast clampne na sve PWM_MAX_PCT)."""
-    pct_in = pct
-    capped_any = False
-    for n in LED_PINS:
-        pct_c = _clamp_pct(pct_in, n)
-        if pct_c != pct_in:
-            capped_any = True
-        led_duty_pct[n] = pct_c
-    reapply_all_leds()
-    if capped_any:
-        print("[PWM] vsechny LED duty = {}% (kde to HW limit dovoli, jinak clamped na PWM_MAX)".format(pct_in))
-    else:
-        print("[PWM] vsechny LED duty = {}%".format(pct_in))
-
-
-last_p_led = None         # naposledy editovana LED pres 'P' prikaz (cil pro +/-)
-DUTY_STEP_PCT = 5         # krok pro '+' / '-'
-
-
 def set_led_duty(n, pct):
-    """Per-LED: nastavi duty jedne LED. Clampne na PWM_MAX_PCT[n]. Zachova on/off stav.
-
-    Pri zadani pres 'P<hex>=<n>' z REPL LED zaroven zapneme (dle zadani:
-    "po nastaveni intenzity automaticky ji zapnout").
-    """
-    global last_p_led
-    requested = pct
-    pct = _clamp_pct(pct, n)
+    """Nastav duty 0..100 % pro jednu LED + clamp na MAX + zapnout."""
+    if pct < 0:
+        pct = 0
+    if pct > PWM_MAX_PCT[n]:
+        pct = PWM_MAX_PCT[n]
     led_duty_pct[n] = pct
-    last_p_led = n
-    led_on[n] = True       # automaticke zapnuti po nastaveni intenzity
+    led_on[n] = True
     apply_led(n)
-    cap_note = " (clamped z {}% na PWM_MAX={}%)".format(requested, PWM_MAX_PCT[n]) if requested != pct else ""
-    print("[PWM] LED GPIO {:2d} duty = {:3d}% ON{}".format(n, pct, cap_note))
+    nvm_save(pwm_freq, led_duty_pct)
+    print("[PWM] GPIO {:2d} duty={}% (MAX={}%) -> ON".format(n, pct, PWM_MAX_PCT[n]))
 
 
-def nudge_last_led(delta_pct):
-    """+/- krok pro naposledy editovanou LED pres 'P' prikaz."""
-    if last_p_led is None:
-        print("[PWM] '+/-' funguje az po prvnim 'P<hex>=<n>' prikazu")
-        return
-    set_led_duty(last_p_led, led_duty_pct[last_p_led] + delta_pct)
-
-
-def print_all_duties():
-    print("[PWM] freq = {} Hz, per-LED duty (max dle tabulky v zadani):".format(pwm_freq))
+def set_all_duty(pct):
+    """Nastav duty pro vsechny LED, clamped na PWM_MAX_PCT kazde LED."""
     for n in LED_PINS:
-        mark = "ON " if led_on[n] else "off"
-        print("       GPIO {:2d} [{}] = {:3d}%  (max {:3d}%)".format(
-            n, mark, led_duty_pct[n], PWM_MAX_PCT[n]))
+        v = min(pct, PWM_MAX_PCT[n])
+        if v < 0:
+            v = 0
+        led_duty_pct[n] = v
+        apply_led(n)
+    nvm_save(pwm_freq, led_duty_pct)
+    print("[PWM] duty (clamped na MAX) -> {}".format(led_duty_pct))
 
 
 def set_pwm_freq(hz):
-    """Zmena PWM frekvence vsech 16 kanalu - deinit a recreate (kvuli sdileni slice na RP2040).
-
-    Pokud recreate selze, zkusi obnovit puvodni frekvenci, aby pole `leds`
-    nezustalo s deinitialized objekty.
-    """
     global pwm_freq
     if hz < PWM_FREQ_MIN or hz > PWM_FREQ_MAX:
         print("[PWM] freq mimo rozsah {}..{} Hz".format(PWM_FREQ_MIN, PWM_FREQ_MAX))
         return
-    old_freq = pwm_freq
+    pwm_freq = hz
     for n in LED_PINS:
         leds[n].deinit()
-    try:
-        for n in LED_PINS:
-            leds[n] = pwmio.PWMOut(gp(n), frequency=hz, duty_cycle=0, variable_frequency=False)
-            apply_led(n)
-        pwm_freq = hz
-        print("[PWM] frequency = {} Hz".format(pwm_freq))
-    except (ValueError, RuntimeError) as e:
-        print("[PWM] CHYBA nastaveni freq {} Hz: {} - obnovuji {} Hz".format(hz, e, old_freq))
-        for n in LED_PINS:
-            # nektere uz mohly byt vytvorene v predchozim pokusu - bezpecne deinit
-            try:
-                leds[n].deinit()
-            except Exception:
-                pass
-        for n in LED_PINS:
-            leds[n] = pwmio.PWMOut(gp(n), frequency=old_freq, duty_cycle=0, variable_frequency=False)
-            apply_led(n)
-        pwm_freq = old_freq
+    for n in LED_PINS:
+        leds[n] = pwmio.PWMOut(gp(n), frequency=pwm_freq, duty_cycle=0, variable_frequency=False)
+        apply_led(n)
+    nvm_save(pwm_freq, led_duty_pct)
+    print("[PWM] frequency = {} Hz".format(pwm_freq))
 
 
-# --- Keep-alive setup (GP16) ---
-print("[INIT] konfigurace keep-alive pinu na GPIO {} (LOW, vypnuto)...".format(KEEP_ALIVE_PIN))
+def factory_reset():
+    global pwm_freq
+    f, d = nvm_defaults()
+    pwm_freq = f
+    for n in LED_PINS:
+        led_duty_pct[n] = d[n]
+    for n in LED_PINS:
+        leds[n].deinit()
+    for n in LED_PINS:
+        leds[n] = pwmio.PWMOut(gp(n), frequency=pwm_freq, duty_cycle=0, variable_frequency=False)
+        led_on[n] = False
+        apply_led(n)
+    nvm_save(pwm_freq, led_duty_pct)
+    print("[PWM] FactoryRESET hotovo. freq={} Hz, duty=defaults z LED-Table".format(pwm_freq))
+
+
+# ====================================================================
+# Keep-alive (GP16) - bezi automaticky od bootu
+# ====================================================================
+print("[INIT] keep-alive na GPIO {} (perioda {}s, pulz {}ms)".format(
+    KEEP_ALIVE_PIN, KA_PERIOD_S, int(KA_PULSE_S * 1000)))
 ka_pin = digitalio.DigitalInOut(gp(KEEP_ALIVE_PIN))
 ka_pin.direction = digitalio.Direction.OUTPUT
 ka_pin.value = False
-ka_enabled = False
-ka_period_start = 0.0
+ka_enabled = True   # auto-on od bootu (zadani: "na pozadi bezi keep-a-live")
+ka_period_start = time.monotonic()
 ka_high_now = False
-print("[INIT]   keep-alive pripraven (po bootu vypnuto).")
 
-# --- DEBUG: onboard LED (GP25) zrcadli keep-alive signal ---------------------
-# Pri rozsviceni KA signalu rozsvitime onboard LED, ale prodloužime na min 1 s
-# (KA pulz je jen 400 ms - kratke na vsimnuti). Sekce se v produkci odebere.
-DEBUG_LED_MIN_ON_S = 1.0
-debug_led = digitalio.DigitalInOut(board.LED)
-debug_led.direction = digitalio.Direction.OUTPUT
-debug_led.value = False
-debug_led_off_t = 0.0
-print("[INIT]   onboard LED (DEBUG) zrcadli KA signal, min pulz {:.1f} s".format(DEBUG_LED_MIN_ON_S))
+# Onboard LED jako mirror keep-alive (DEBUG sekce)
+onboard = digitalio.DigitalInOut(board.LED)
+onboard.direction = digitalio.Direction.OUTPUT
+onboard.value = False
+# DEBUG: prodlouzit puls onboard LED aspon na 1 s
+DEBUG_KA_LED_MIN_S = 1.0
+ka_led_off_at = 0.0
+ka_led_on = False
 
 
 def keep_alive_tick(t):
-    """Neblokujici keep-alive: kazdych 10 s pulz 400 ms HIGH.
-    Soucasne zrcadli signal na onboard LED s prodlouzenim na min 1 s (DEBUG).
-    """
-    global ka_period_start, ka_high_now
+    global ka_period_start, ka_high_now, ka_led_off_at, ka_led_on
     if not ka_enabled:
         if ka_high_now:
             ka_pin.value = False
             ka_high_now = False
-        _debug_led_tick(t, ka_pulse_active=False)
+        # onboard LED dobehnuti
+        if ka_led_on and t >= ka_led_off_at:
+            onboard.value = False
+            ka_led_on = False
         return
     dt = t - ka_period_start
     if dt >= KA_PERIOD_S:
@@ -334,23 +339,18 @@ def keep_alive_tick(t):
         if not ka_high_now:
             ka_pin.value = True
             ka_high_now = True
+            # DEBUG: rozsvit onboard, drz aspon DEBUG_KA_LED_MIN_S
+            onboard.value = True
+            ka_led_on = True
+            ka_led_off_at = t + max(DEBUG_KA_LED_MIN_S, KA_PULSE_S)
     else:
         if ka_high_now:
             ka_pin.value = False
             ka_high_now = False
-    _debug_led_tick(t, ka_pulse_active=ka_high_now)
-
-
-def _debug_led_tick(t, ka_pulse_active):
-    """Onboard LED kopiruje KA, ale rozsviceni se prodluzuje na min DEBUG_LED_MIN_ON_S."""
-    global debug_led_off_t
-    if ka_pulse_active:
-        if not debug_led.value:
-            debug_led.value = True
-        debug_led_off_t = t + DEBUG_LED_MIN_ON_S    # prubezne posouvame strop
-    else:
-        if debug_led.value and t >= debug_led_off_t:
-            debug_led.value = False
+    # onboard LED dobehnuti po skonceni pulzu
+    if ka_led_on and t >= ka_led_off_at:
+        onboard.value = False
+        ka_led_on = False
 
 
 def keep_alive_on():
@@ -361,7 +361,7 @@ def keep_alive_on():
     ka_enabled = True
     ka_period_start = time.monotonic()
     ka_high_now = False
-    print("[KA] keep-alive ZAPNUTO (perioda 10 s, pulz 400 ms)")
+    print("[KA] keep-alive ZAPNUTO")
 
 
 def keep_alive_off():
@@ -372,16 +372,125 @@ def keep_alive_off():
     ka_enabled = False
     ka_pin.value = False
     ka_high_now = False
+    onboard.value = False
     print("[KA] keep-alive VYPNUTO")
 
 
-# --- Alternovani GPIO 0 / GPIO 1 (exkluzivni dvojice) ---
+# ====================================================================
+# 1-wire LED (GP17)
+# ====================================================================
+print("[INIT] 1-wire LED ({}x WS2812/Inolux na GPIO {}, brightness={})".format(
+    N_ONEWIRE_PIXELS, ONEWIRE_PIN, ONEWIRE_BRIGHTNESS))
+onewire = neopixel.NeoPixel(
+    gp(ONEWIRE_PIN), N_ONEWIRE_PIXELS,
+    brightness=ONEWIRE_BRIGHTNESS, auto_write=False, pixel_order=neopixel.GRB,
+)
+onewire.fill((0, 0, 0))
+onewire.show()
+
+
+def onewire_off():
+    onewire.fill((0, 0, 0))
+    onewire.show()
+
+
+def onewire_seq_test(color=(0, 255, 0), step_s=0.15):
+    """Init test: postupne rozsvit + postupne zhasinat pixel po pixelu."""
+    for i in range(N_ONEWIRE_PIXELS):
+        onewire[i] = color
+        onewire.show()
+        time.sleep(step_s)
+        onewire[i] = (0, 0, 0)
+        onewire.show()
+
+
+def onewire_smoke_test():
+    """R/G/B na celem retezu - rychla diagnostika HW."""
+    print("[1WIRE] smoke RED..."); onewire.fill((255, 0, 0)); onewire.show(); time.sleep(0.6)
+    print("[1WIRE] smoke GREEN..."); onewire.fill((0, 255, 0)); onewire.show(); time.sleep(0.6)
+    print("[1WIRE] smoke BLUE..."); onewire.fill((0, 0, 255)); onewire.show(); time.sleep(0.6)
+    onewire_off()
+
+
+# ====================================================================
+# Buzzer (GP28) - jen digital output 1/0, neblokujici prehravac rytmu
+# Aktivni buzzer ma pevnou frekvenci - melodie jsou rytmicke (delky pipu).
+# Nezabira PWM slice, takze neni v konfliktu s GP12 (STAVBA).
+# ====================================================================
+print("[INIT] buzzer (digital) na GPIO {}".format(BUZZER_PIN))
+buzzer_pin = digitalio.DigitalInOut(gp(BUZZER_PIN))
+buzzer_pin.direction = digitalio.Direction.OUTPUT
+buzzer_pin.value = False
+
+# Rytmus = posloupnost (level: bool, doba_ms: int).
+# True = buzzer zni, False = ticho.
+PIP_SHORT = (True, 80)
+PIP_LONG = (True, 200)
+REST_SHORT = (False, 60)
+REST_MED = (False, 120)
+
+# Po stisku SW4 / startu PustAuto - jedno sustained "PIIIIP"
+RHYTHM_SW4 = (
+    (True, 280),
+)
+
+buzzer_seq = None
+buzzer_idx = 0
+buzzer_next_t = 0.0
+
+
+def _buzzer_apply_step(t):
+    """Aplikuje aktualni krok na hardware a nastavi cas dalsiho prepnuti."""
+    global buzzer_next_t
+    level, dur_ms = buzzer_seq[buzzer_idx]
+    buzzer_pin.value = level
+    buzzer_next_t = t + dur_ms / 1000.0
+
+
+def buzzer_play_rhythm(seq):
+    """Spusti neblokujici prehravani rytmu."""
+    global buzzer_seq, buzzer_idx
+    if len(seq) == 0:
+        return
+    buzzer_seq = seq
+    buzzer_idx = 0
+    _buzzer_apply_step(time.monotonic())
+    print("[BUZZER] rytmus ({} kroku)".format(len(seq)))
+
+
+def buzzer_pip():
+    """Zkratka pro jeden kratky pip."""
+    buzzer_play_rhythm((PIP_SHORT,))
+
+
+def buzzer_silence():
+    global buzzer_seq
+    buzzer_pin.value = False
+    buzzer_seq = None
+
+
+def buzzer_tick(t):
+    global buzzer_idx, buzzer_seq
+    if buzzer_seq is None:
+        return
+    if t < buzzer_next_t:
+        return
+    buzzer_idx += 1
+    if buzzer_idx >= len(buzzer_seq):
+        buzzer_pin.value = False
+        buzzer_seq = None
+        return
+    _buzzer_apply_step(t)
+
+
+# ====================================================================
+# Exkluzivni dvojice GPIO 0/1 - alternovani (prikaz 'A', SW5)
+# ====================================================================
 alt_mode = False
 alt_start = 0.0
 
 
 def alt_start_now():
-    """Spusti alternovani exkluzivni dvojice. GPIO 0 zacne svitit."""
     global alt_mode, alt_start
     alt_mode = True
     alt_start = time.monotonic()
@@ -391,12 +500,10 @@ def alt_start_now():
 
 def alt_stop():
     global alt_mode
-    if alt_mode:
-        alt_mode = False
+    alt_mode = False
 
 
 def alt_tick(t):
-    """Stridani GPIO 0/1 s periodou ALT_PERIOD_S (0.5 s kazdy)."""
     if not alt_mode:
         return
     phase = (t - alt_start) % ALT_PERIOD_S
@@ -414,628 +521,455 @@ def alt_tick(t):
             set_led(b, True)
 
 
-# --- RozsvitJerab (SWITCH 2) -------------------------------------------------
-# LED se rozsveci POSTUPNE v poradi (14, 15, 10, 0, 9, 13) - stejna sekvence
-# jaka je v Init testu, jen bez YELLOW TOP (GPIO 1). Krok 100 ms mezi LED.
-# Po 4 s OD ZAPNUTI POSLEDNI LED v sekvenci zacne YELLOW (GPIO 1) probliknuti:
-# 3 s RED (GPIO 0) sviti / 300 ms YELLOW sviti (RED zhasla - exkluzivni par).
-JERAB_SEQ = (14, 15, 10, 0, 9, 13)   # postupne rozsveceni, BEZ YELLOW TOP (1)
-JERAB_TOP_PINS = (0, 1)               # RED, YELLOW (jen jeden najednou)
+# ====================================================================
+# HRA funkce - kazda ma start/stop/tick
+# ====================================================================
 
+# ---- PozorStavba (auto on boot, blika POZOR LED 5/6) ----
+pozor_active = False
+pozor_paused = False  # po manualnim toggle LED 5/6 v REPL
+pozor_last_t = 0.0
+pozor_state = 0       # 0: LED5 ON / LED6 OFF, 1: LED5 OFF / LED6 ON
+
+
+def pozor_start():
+    global pozor_active, pozor_last_t, pozor_state, pozor_paused
+    pozor_active = True
+    pozor_paused = False
+    pozor_last_t = time.monotonic()
+    pozor_state = 0
+    set_led(POZOR_PINS[0], True)
+    set_led(POZOR_PINS[1], False)
+    print("[POZOR] PozorStavba START")
+
+
+def pozor_stop():
+    global pozor_active
+    pozor_active = False
+    set_led(POZOR_PINS[0], False)
+    set_led(POZOR_PINS[1], False)
+    print("[POZOR] PozorStavba STOP")
+
+
+def pozor_pause():
+    global pozor_paused
+    pozor_paused = True
+
+
+def pozor_resume():
+    global pozor_paused, pozor_last_t, pozor_state
+    pozor_paused = False
+    pozor_last_t = time.monotonic()
+    pozor_state = 0
+    set_led(POZOR_PINS[0], True)
+    set_led(POZOR_PINS[1], False)
+    print("[POZOR] obnoveno")
+
+
+def pozor_tick(t):
+    global pozor_last_t, pozor_state
+    if not pozor_active or pozor_paused:
+        return
+    if (t - pozor_last_t) >= POZOR_BLINK_S:
+        pozor_state ^= 1
+        set_led(POZOR_PINS[0], pozor_state == 0)
+        set_led(POZOR_PINS[1], pozor_state == 1)
+        pozor_last_t = t
+
+
+# ---- vabeniKoristi (LED 11, breathing 50% PWM_MAX) ----
+vabeni_active = False
+vabeni_start_t = 0.0
+vabeni_scheduled_at = None  # plan pro start (po bootu nebo po END SEMAFORu)
+
+
+def vabeni_schedule(delay_s):
+    global vabeni_scheduled_at
+    vabeni_scheduled_at = time.monotonic() + delay_s
+    print("[VABENI] planovano za {:.1f} s".format(delay_s))
+
+
+def vabeni_start():
+    global vabeni_active, vabeni_start_t, vabeni_scheduled_at
+    vabeni_active = True
+    vabeni_start_t = time.monotonic()
+    vabeni_scheduled_at = None
+    print("[VABENI] START (LED {}, breathing)".format(TLACITKO_PIN))
+
+
+def vabeni_stop():
+    global vabeni_active, vabeni_scheduled_at
+    vabeni_active = False
+    vabeni_scheduled_at = None
+    set_led(TLACITKO_PIN, False)
+
+
+def vabeni_tick(t):
+    global vabeni_active
+    if vabeni_scheduled_at is not None and t >= vabeni_scheduled_at:
+        vabeni_start()
+    if not vabeni_active:
+        return
+    # Jeden tep = plynuly nabeh i dobeh jasu (rozsvicena cast), pak kratka tma.
+    # Tma je pevne VABENI_DARK_S (max 300 ms), zbytek periody je rozsvicena cast.
+    cyc = (t - vabeni_start_t) % VABENI_PERIOD_S
+    lit_dur = VABENI_PERIOD_S - VABENI_DARK_S
+    if cyc < lit_dur:
+        # sin(0..pi): 0 -> 1 -> 0 (hladky fade-in i fade-out) + gamma korekce
+        level = math.sin(cyc / lit_dur * math.pi) ** VABENI_GAMMA
+    else:
+        level = 0.0
+    # max 50 % z PWM_MAX (specifikum vabeniKoristi)
+    target = level * 0.5 * PWM_MAX_PCT[TLACITKO_PIN]
+    apply_led_with_duty(TLACITKO_PIN, int(target))
+
+
+# ---- MajakBuldozer (LED 7, sawtooth: 0..MAX se kratkym holdem na MAX) ----
+majak_active = False
+majak_start_t = 0.0
+
+
+def majak_start():
+    global majak_active, majak_start_t
+    majak_active = True
+    majak_start_t = time.monotonic()
+    print("[MAJAK] MajakBuldozer START")
+
+
+def majak_stop():
+    global majak_active
+    majak_active = False
+    set_led(BULDOZER_PIN, False)
+    print("[MAJAK] MajakBuldozer STOP")
+
+
+def majak_toggle():
+    if majak_active:
+        majak_stop()
+    else:
+        majak_start()
+
+
+def majak_tick(t):
+    if not majak_active:
+        return
+    # majak: hladky sinusoidalni prulet 0 -> MAX -> 0 v ramci jedne periody.
+    # sin^N drzi LED vetsinu casu pri nule a kratce vyletne na MAX (efekt majaku).
+    phase = ((t - majak_start_t) % MAJAK_PERIOD_S) / MAJAK_PERIOD_S
+    s = math.sin(phase * math.pi)        # 0 -> 1 -> 0 (jedna pulvlna)
+    amp = s ** MAJAK_SHAPE_POW            # zostri vrchol, prodlouzi tichou cast
+    target = amp * PWM_MAX_PCT[BULDOZER_PIN]
+    apply_led_with_duty(BULDOZER_PIN, int(target))
+
+
+# ---- RozsvitJerab (sekvence + zluta po 4s problikava) ----
 jerab_active = False
-jerab_seq_idx = 0
-jerab_last_step_t = 0.0
-jerab_seq_done_t = 0.0     # cas zapnuti POSLEDNI LED v sekvenci (start odpoctu 4 s)
-jerab_top_started = False
-jerab_top_phase = 0        # 0 = RED svici, 1 = YELLOW svici
-jerab_top_phase_t = 0.0
+jerab_step = 0
+jerab_last_t = 0.0
+jerab_yellow_started = False
+jerab_yellow_t = 0.0
+jerab_yellow_state = False  # False=RED ON (zluta OFF), True=YELLOW ON (cervena OFF)
+jerab_yellow_phase_t = 0.0
+JERAB_INIT_DELAY_S = JERAB_INIT_DELAY_MS / 1000.0
 
 
-def jerab_on():
-    """Spusti JERAB: postupne rozsveceni (14,15,10,0,9,13), YELLOW blikani 4s po posledni LED."""
-    global jerab_active, jerab_seq_idx, jerab_last_step_t, jerab_seq_done_t
-    global jerab_top_started, jerab_top_phase, jerab_top_phase_t
-    if jerab_active:
-        return
+def jerab_start():
+    global jerab_active, jerab_step, jerab_last_t, jerab_yellow_started, jerab_yellow_state
     jerab_active = True
-    jerab_seq_idx = 0
-    jerab_last_step_t = time.monotonic()
-    jerab_seq_done_t = 0.0           # nastavi se az tick zapne posledni LED
-    jerab_top_started = False
-    jerab_top_phase = 0
-    jerab_top_phase_t = 0.0
-    # zhasit vsechny JERAB LED - sekvenci pak rozsvecuje tick
-    for n in JERAB_PINS:
-        set_led(n, False)
-    print("[JERAB] RozsvitJerab START (sekvence {}, krok {} ms, YELLOW blikani 4s po posledni LED)".format(
-        list(JERAB_SEQ), int(JERAB_STEP_S * 1000)))
+    jerab_step = 0
+    jerab_last_t = time.monotonic()
+    jerab_yellow_started = False
+    jerab_yellow_state = False
+    print("[JERAB] RozsvitJerab START")
 
 
-def jerab_off():
-    global jerab_active, jerab_top_started
-    if not jerab_active:
-        return
+def jerab_stop():
+    global jerab_active, jerab_yellow_started
     jerab_active = False
-    jerab_top_started = False
+    jerab_yellow_started = False
     for n in JERAB_PINS:
         set_led(n, False)
     print("[JERAB] RozsvitJerab STOP")
 
 
 def jerab_tick(t):
-    """Postupne rozsveceni sekvence (vc. GPIO 0) + YELLOW blikani 4 s po posledni LED."""
-    global jerab_seq_idx, jerab_last_step_t, jerab_seq_done_t
-    global jerab_top_started, jerab_top_phase, jerab_top_phase_t
+    global jerab_step, jerab_last_t, jerab_yellow_started
+    global jerab_yellow_t, jerab_yellow_state, jerab_yellow_phase_t
     if not jerab_active:
         return
-    # 1) postupne rozsveceni sekvence (14, 15, 10, 0, 9, 13)
-    if jerab_seq_idx < len(JERAB_SEQ):
-        if (t - jerab_last_step_t) >= JERAB_STEP_S:
-            n = JERAB_SEQ[jerab_seq_idx]
+    # 1. faze: postupne zapinani LED z JERAB_PINS_NO_YELLOW
+    if jerab_step < len(JERAB_PINS_NO_YELLOW):
+        if (t - jerab_last_t) >= JERAB_INIT_DELAY_S:
+            n = JERAB_PINS_NO_YELLOW[jerab_step]
             set_led(n, True)
-            jerab_seq_idx += 1
-            jerab_last_step_t = t
-            if jerab_seq_idx == len(JERAB_SEQ):
-                # posledni LED zapnuta - od tohoto okamziku ceka 4 s na zacatek YELLOW blikani
-                jerab_seq_done_t = t
-        return  # behem rozsveceni jeste nestartujeme blikani
-    # 2) YELLOW probliknuti po 4 s od POSLEDNI LED (GPIO 0 uz sviti ze sekvence)
-    if not jerab_top_started:
-        if (t - jerab_seq_done_t) >= JERAB_TOP_BLINK_DELAY_S:
-            jerab_top_started = True
-            jerab_top_phase = 0          # 0 = RED on, 1 = YELLOW probliknuti
-            jerab_top_phase_t = t
+            jerab_step += 1
+            jerab_last_t = t
         return
-    # cyklicke prepinani RED <-> YELLOW (exkluzivni par)
-    hold = JERAB_TOP_RED_S if jerab_top_phase == 0 else JERAB_TOP_YELLOW_S
-    if (t - jerab_top_phase_t) >= hold:
-        jerab_top_phase = 1 - jerab_top_phase
-        jerab_top_phase_t = t
-        if jerab_top_phase == 0:
-            set_led(JERAB_TOP_PINS[1], False)
-            set_led(JERAB_TOP_PINS[0], True)
+    # 2. faze: cekani 4 s po posledni LED, pak start problikavani GPIO 0 vs GPIO 1
+    if not jerab_yellow_started:
+        if (t - jerab_last_t) >= JERAB_YELLOW_START_DELAY_S:
+            jerab_yellow_started = True
+            jerab_yellow_state = True  # zacni zlutou
+            set_led(0, False)
+            set_led(JERAB_YELLOW, True)
+            jerab_yellow_phase_t = t
+            print("[JERAB] zluta zacina problikavat")
+        return
+    # 3. faze: stridani RED (3 s) / YELLOW (300 ms)
+    if jerab_yellow_state:
+        # zluta sviti
+        if (t - jerab_yellow_phase_t) >= JERAB_YELLOW_ON_S:
+            set_led(JERAB_YELLOW, False)
+            set_led(0, True)
+            jerab_yellow_state = False
+            jerab_yellow_phase_t = t
+    else:
+        # cervena sviti
+        if (t - jerab_yellow_phase_t) >= JERAB_RED_ON_S:
+            set_led(0, False)
+            set_led(JERAB_YELLOW, True)
+            jerab_yellow_state = True
+            jerab_yellow_phase_t = t
+
+
+# ---- RozsvitStavbu (STAVBA fade-in jako sodikova vybojka + zrcadlovy fade-out) ----
+# Stavovy automat sledujici prubeh jasu:
+#   "idle"      - LED zhasnuta
+#   "fade_in"   - rozsviceni (kvadraticka krivka, pomale na zacatku)
+#   "on"        - sviti na PWM_MAX
+#   "fade_out"  - zhasinani (zrcadlova krivka, plynule z aktualniho jasu)
+# Pri opakovanem stisku/uvolneni SW3 behem prechodu se faze prelozi a pokracuje
+# plynule z aktualni urovne jasu (zadny skok dolu/nahoru).
+stavba_phase = "idle"
+stavba_current_pct = 0.0    # aktualni jas v % (float pro plynulost)
+stavba_last_tick_t = 0.0
+
+
+def stavba_start():
+    """SW3 STISK - rozsviceni. Pokud bezi fade-out, plynule prejde do fade-in."""
+    global stavba_phase, stavba_last_tick_t
+    if stavba_phase == "on":
+        return
+    stavba_phase = "fade_in"
+    stavba_last_tick_t = time.monotonic()
+    set_led(MICHACKA_PIN, True)
+    led_on[STAVBA_PIN] = True
+    print("[STAVBA] RozsvitStavbu START (fade-in z {:.0f}%)".format(stavba_current_pct))
+
+
+def stavba_stop():
+    """SW3 UVOLNENI - spusti zrcadlovy fade-out z aktualniho jasu."""
+    global stavba_phase, stavba_last_tick_t
+    if stavba_phase == "idle":
+        return
+    stavba_phase = "fade_out"
+    stavba_last_tick_t = time.monotonic()
+    set_led(MICHACKA_PIN, False)
+    print("[STAVBA] RozsvitStavbu STOP (fade-out z {:.0f}%)".format(stavba_current_pct))
+
+
+def stavba_force_off():
+    """Okamzite vypnuti bez fade-out (pouziva sleepBox / stop_all_hra)."""
+    global stavba_phase, stavba_current_pct
+    stavba_phase = "idle"
+    stavba_current_pct = 0.0
+    set_led(MICHACKA_PIN, False)
+    set_led(STAVBA_PIN, False)
+
+
+def stavba_tick(t):
+    """Krok nelinearniho prechodu mezi 0 a PWM_MAX. Krivka pct = frac^2 * MAX
+    (sodikova vybojka - pomale na zacatku, rychle na konci)."""
+    global stavba_current_pct, stavba_phase, stavba_last_tick_t
+    if stavba_phase == "idle":
+        return
+    dt = t - stavba_last_tick_t
+    stavba_last_tick_t = t
+    MAX = PWM_MAX_PCT[STAVBA_PIN]
+    if MAX <= 0:
+        return
+    # vypocti aktualni "frac" z aktualniho pct (kvuli plynulemu prechodu fazi)
+    frac = math.sqrt(stavba_current_pct / MAX) if stavba_current_pct > 0 else 0.0
+
+    if stavba_phase == "fade_in":
+        frac += dt / STAVBA_FADE_IN_S
+        if frac >= 1.0:
+            stavba_current_pct = MAX
+            stavba_phase = "on"
         else:
-            set_led(JERAB_TOP_PINS[0], False)
-            set_led(JERAB_TOP_PINS[1], True)
+            stavba_current_pct = frac * frac * MAX
+    elif stavba_phase == "fade_out":
+        frac -= dt / STAVBA_FADE_OUT_S
+        if frac <= 0.0:
+            stavba_current_pct = 0.0
+            stavba_phase = "idle"
+            led_on[STAVBA_PIN] = False
+        else:
+            stavba_current_pct = frac * frac * MAX
+    # "on" - drz MAX, nic nepocitej
+    apply_led_with_duty(STAVBA_PIN, int(stavba_current_pct))
 
 
-# --- PustAuto (SWITCH 5): semafor pro odjezd auta -----------------------------
-# Fazovy stroj se 4 + 1 fazemi:
-#   INIT      - rozsviti RED na semaforu + 1. OneWire pixel bilou
-#   RUN_SEM   - klasicka semaforova sekvence skoncici u GREEN
-#   GO        - bezici cara pres 12 OneWire pixelu, zrychluje, na konci zhasne
-#   ODJETO    - zelena se klasicky vrati na cervenou
-#   END       - vse zhasnuto, stroj se zastavi
-# Tabulka casovych prodlev MEZI fazemi (z zadani: cas mezi koncem akce
-# aktualni faze a startem dalsi faze):
-PA_TRANSITION_S = {
-    "INIT":    3.0,
-    "RUN_SEM": 1.0,
-    "GO":      3.0,
-    "ODJETO":  3.0,
-}
-# Vnitrni casovani semafor sekvenci (sub-step v ramci faze):
-PA_RUN_REDYELLOW_S = 1.0     # RED + YELLOW spolu (klasicka faze pred GREEN)
-PA_OD_GREEN_HOLD_S = 1.5     # ODJETO: jak dlouho jeste GREEN po vstupu, pak YELLOW
-PA_OD_YELLOW_S = 1.5         # ODJETO: YELLOW pred RED
-# GO faze: 12 pixelu, doba na pixel klesa linearne (zrychluje):
-PA_GO_PIX_FIRST_S = 0.45
-PA_GO_PIX_LAST_S = 0.08
-
-PA_RED_PIN = 3
-PA_YELLOW_PIN = 2
-PA_GREEN_PIN = 4
-
-pa_active = False
-pa_phase = None              # "INIT" | "RUN_SEM" | "GO" | "ODJETO" | "END"
-pa_action_done = False       # True = animace faze probehla, cekame na prodlevu
-pa_action_done_t = 0.0
-# RUN_SEM sub-state
-pa_run_sub = 0
-pa_run_sub_t = 0.0
-# GO sub-state
-pa_go_pixel = 0              # 0..N_ONEWIRE_PIXELS  (N = pri vystupu)
-pa_go_pix_start_t = 0.0
-# ODJETO sub-state
-pa_od_sub = 0
-pa_od_sub_t = 0.0
+# ---- PustAuto (SEMAFOR) - state machine ----
+SEM_IDLE, SEM_INIT, SEM_RUN, SEM_GO, SEM_ODJETO, SEM_END = 0, 1, 2, 3, 4, 5
+sem_state = SEM_IDLE
+sem_t = 0.0      # cas vstupu do aktualni faze
+sem_sub_t = 0.0  # casovac uvnitr faze
+sem_sub = 0
+sem_was_vabeni = False  # mela vabeni bezet pred SEMAFOR?
 
 
-def _pa_clear_semafor():
-    for n in (PA_RED_PIN, PA_YELLOW_PIN, PA_GREEN_PIN):
-        set_led(n, False)
-
-
-def _pa_clear_onewire():
+def sem_start():
+    """SW4 - tlacitko, dobehne dokonce. Pri zapnuti deaktivuje vabeniKoristi.
+    Pokud uz sekvence bezi, ignoruje opakovany stisk (zadny zvuk, zadne restartovani)."""
+    global sem_state, sem_t, sem_sub, sem_sub_t, sem_was_vabeni
+    if sem_state != SEM_IDLE:
+        print("[SEMAFOR] uz bezi, ignoruji nove spusteni")
+        return
+    # zvuk zaroven se spustenim sekvence - jen pri uspesnem startu
+    buzzer_play_rhythm(RHYTHM_SW4)
+    sem_was_vabeni = vabeni_active or (vabeni_scheduled_at is not None)
+    if vabeni_active or vabeni_scheduled_at is not None:
+        vabeni_stop()
+    sem_state = SEM_INIT
+    sem_t = time.monotonic()
+    sem_sub = 0
+    sem_sub_t = sem_t
+    # INIT: sviti cervena na semaforu + 1. OneWire bila
+    set_led(SEMAFOR_RED, True)
+    set_led(SEMAFOR_YELLOW, False)
+    set_led(SEMAFOR_GREEN, False)
     onewire.fill((0, 0, 0))
-    onewire.show()
-
-
-def _pa_enter_init(t):
-    global pa_phase, pa_action_done, pa_action_done_t
-    pa_phase = "INIT"
-    _pa_clear_semafor()
-    _pa_clear_onewire()
-    set_led(PA_RED_PIN, True)
     onewire[0] = (255, 255, 255)
     onewire.show()
-    pa_action_done = True   # INIT je staticka akce - okamzite hotova, jen cekame na prodlevu
-    pa_action_done_t = t
-    print("[AUTO] INIT (RED + OneWire[0] WHITE) -> prodleva {:.1f} s".format(PA_TRANSITION_S["INIT"]))
+    print("[SEMAFOR] PustAuto START (INIT)")
 
 
-def _pa_enter_run_sem(t):
-    global pa_phase, pa_action_done, pa_run_sub, pa_run_sub_t
-    pa_phase = "RUN_SEM"
-    # OneWire[0] nechame svitit (z INIT) - bude pokracovat do zacatku GO faze.
-    # Zacatek: RED uz sviti z INIT. Sub-step 0 = pridat YELLOW po PA_RUN_REDYELLOW_S
-    pa_run_sub = 0
-    pa_run_sub_t = t
-    pa_action_done = False
-    set_led(PA_RED_PIN, True)
-    set_led(PA_YELLOW_PIN, False)
-    set_led(PA_GREEN_PIN, False)
-    print("[AUTO] RUN_SEM start (RED -> RED+YELLOW -> GREEN, OneWire[0] sviti dal)")
+def sem_abort():
+    """Force-stop (napr. v sleepBoxu)."""
+    global sem_state
+    sem_state = SEM_IDLE
+    set_led(SEMAFOR_RED, False)
+    set_led(SEMAFOR_YELLOW, False)
+    set_led(SEMAFOR_GREEN, False)
+    onewire_off()
 
 
-def _pa_tick_run_sem(t):
-    """Sub-stroj RUN_SEM. Sub-state:
-       0 = RED sviti, cekame PA_RUN_REDYELLOW_S, pak pridame YELLOW
-       1 = RED+YELLOW sviti, cekame PA_RUN_REDYELLOW_S, pak GREEN (zhasni RED+YELLOW)
-       2 = GREEN sviti -> akce hotova
-    """
-    global pa_run_sub, pa_run_sub_t, pa_action_done, pa_action_done_t
-    if pa_run_sub == 0:
-        if (t - pa_run_sub_t) >= PA_RUN_REDYELLOW_S:
-            set_led(PA_YELLOW_PIN, True)
-            pa_run_sub = 1
-            pa_run_sub_t = t
-            print("[AUTO] RUN_SEM: RED+YELLOW")
-    elif pa_run_sub == 1:
-        if (t - pa_run_sub_t) >= PA_RUN_REDYELLOW_S:
-            set_led(PA_RED_PIN, False)
-            set_led(PA_YELLOW_PIN, False)
-            set_led(PA_GREEN_PIN, True)
-            pa_run_sub = 2
-            pa_action_done = True
-            pa_action_done_t = t
-            print("[AUTO] RUN_SEM: GREEN (action done, prodleva {:.1f} s)".format(PA_TRANSITION_S["RUN_SEM"]))
+def sem_tick(t):
+    global sem_state, sem_t, sem_sub, sem_sub_t
+    if sem_state == SEM_IDLE:
+        return
+    dt = t - sem_t
 
+    if sem_state == SEM_INIT:
+        # cekame SEM_INIT_HOLD_S, pak RUN_SEMAFOR
+        if dt >= SEM_INIT_HOLD_S:
+            sem_state = SEM_RUN
+            sem_t = t
+            sem_sub = 0
+            sem_sub_t = t
+            print("[SEMAFOR] -> RUN_SEMAFOR")
+        return
 
-def _pa_enter_go(t):
-    global pa_phase, pa_action_done, pa_go_pixel, pa_go_pix_start_t
-    pa_phase = "GO"
-    # OneWire[0] uz sviti (z INIT/RUN_SEM) - na nej navazeme fade-out + fade-in[1].
-    # Ostatni pixely jsou jiz zhasnute, neresetujeme.
-    pa_go_pixel = 0
-    pa_go_pix_start_t = t
-    pa_action_done = False
-    # GREEN zustava svitit - "zustane svitit zelena" + cara probehne
-    print("[AUTO] GO start (bezici cara z OneWire[0], zrychluje, {} -> {} s/pixel)".format(
-        PA_GO_PIX_FIRST_S, PA_GO_PIX_LAST_S))
+    if sem_state == SEM_RUN:
+        # RED -> RED+YELLOW (kratce) -> GREEN, klasicky semafor
+        if sem_sub == 0:
+            # RED hori - po SEM_RUN_RED_TO_YELLOW_S pridej YELLOW
+            if (t - sem_sub_t) >= SEM_RUN_RED_TO_YELLOW_S:
+                set_led(SEMAFOR_YELLOW, True)
+                sem_sub = 1
+                sem_sub_t = t
+        elif sem_sub == 1:
+            # RED + YELLOW po SEM_RUN_YELLOW_S -> jen GREEN
+            if (t - sem_sub_t) >= SEM_RUN_YELLOW_S:
+                set_led(SEMAFOR_RED, False)
+                set_led(SEMAFOR_YELLOW, False)
+                set_led(SEMAFOR_GREEN, True)
+                sem_sub = 2
+                sem_sub_t = t
+        elif sem_sub == 2:
+            # GREEN drz pak prejdi do GO
+            if (t - sem_sub_t) >= SEM_RUN_GREEN_HOLD_S:
+                sem_state = SEM_GO
+                sem_t = t
+                sem_sub = 0
+                sem_sub_t = t
+                onewire.fill((0, 0, 0))
+                onewire.show()
+                print("[SEMAFOR] -> GO (zelena + ridici cara)")
+        return
 
-
-def _go_pixel_duration(i):
-    """Doba na i-ty prechod (0..N-1). Linearni interpolace mezi FIRST a LAST."""
-    n = N_ONEWIRE_PIXELS - 1   # delimo poctem prechodu
-    if n <= 0:
-        return PA_GO_PIX_FIRST_S
-    frac = i / n
-    return PA_GO_PIX_FIRST_S + (PA_GO_PIX_LAST_S - PA_GO_PIX_FIRST_S) * frac
-
-
-def _pa_tick_go(t):
-    """Bezici cara: pixel i fade-out, pixel i+1 fade-in.
-       Po dojeti k poslednimu fade-out a hotovo.
-    """
-    global pa_go_pixel, pa_go_pix_start_t, pa_action_done, pa_action_done_t
-    if pa_go_pixel >= N_ONEWIRE_PIXELS:
-        return  # uz hotovo
-    dur = _go_pixel_duration(pa_go_pixel)
-    progress = (t - pa_go_pix_start_t) / dur
-    if progress >= 1.0:
-        progress = 1.0
-    # aktualni pixel klesa, dalsi stoupa (pokud existuje)
-    cur = pa_go_pixel
-    nxt = cur + 1
-    bri_cur = 1.0 - progress
-    bri_nxt = progress
-    onewire[cur] = (int(255 * bri_cur), int(255 * bri_cur), int(255 * bri_cur))
-    if nxt < N_ONEWIRE_PIXELS:
-        onewire[nxt] = (int(255 * bri_nxt), int(255 * bri_nxt), int(255 * bri_nxt))
-    onewire.show()
-    if progress >= 1.0:
-        # konec aktualniho prechodu - aktualni pixel je vypnuty
-        onewire[cur] = (0, 0, 0)
+    if sem_state == SEM_GO:
+        # rozjizdejici se cara - prvni pixel sviti dlouho, posledni kratce
+        elapsed = t - sem_t
+        if elapsed >= SEM_GO_TO_ODJETO_S:
+            onewire.fill((0, 0, 0))
+            onewire.show()
+            sem_state = SEM_ODJETO
+            sem_t = t
+            sem_sub = 0
+            sem_sub_t = t
+            print("[SEMAFOR] -> ODJETO")
+            return
+        # vypocet ktery pixel aktualne sviti a jeho jas
+        # casovani zrychluje: pixel i sviti dt_i = base * (N-i)/N
+        # zjednodusene rozpocitej okno SEM_GO_TO_ODJETO_S na N pixelu nelinearne
+        # frac = elapsed / SEM_GO_TO_ODJETO_S, lehce zrychlujici -> sqrt
+        frac = elapsed / SEM_GO_TO_ODJETO_S
+        idx = int(frac * N_ONEWIRE_PIXELS)
+        if idx >= N_ONEWIRE_PIXELS:
+            idx = N_ONEWIRE_PIXELS - 1
+        onewire.fill((0, 0, 0))
+        # rozsvit aktualni s plnym jasem a predchozi se zhasinanim (efekt jedouci cary)
+        bright = 255
+        onewire[idx] = (bright, bright, bright)
+        if idx >= 1:
+            onewire[idx - 1] = (bright // 4, bright // 4, bright // 4)
         onewire.show()
-        pa_go_pixel = nxt
-        pa_go_pix_start_t = t
-        if pa_go_pixel >= N_ONEWIRE_PIXELS:
-            # uplne hotovo
-            _pa_clear_onewire()
-            pa_action_done = True
-            pa_action_done_t = t
-            print("[AUTO] GO: hotovo (prodleva {:.1f} s)".format(PA_TRANSITION_S["GO"]))
-
-
-def _pa_enter_odjeto(t):
-    global pa_phase, pa_action_done, pa_od_sub, pa_od_sub_t
-    pa_phase = "ODJETO"
-    pa_od_sub = 0
-    pa_od_sub_t = t
-    pa_action_done = False
-    # GREEN sviti (z GO faze). Stavy: 0 = GREEN hold, 1 = YELLOW, 2 = RED (hotovo)
-    set_led(PA_GREEN_PIN, True)
-    set_led(PA_YELLOW_PIN, False)
-    set_led(PA_RED_PIN, False)
-    print("[AUTO] ODJETO start (GREEN -> YELLOW -> RED)")
-
-
-def _pa_tick_odjeto(t):
-    global pa_od_sub, pa_od_sub_t
-    global pa_action_done, pa_action_done_t
-    if pa_od_sub == 0:
-        # GREEN sviti, pak prepnout na YELLOW
-        if (t - pa_od_sub_t) >= PA_OD_GREEN_HOLD_S:
-            set_led(PA_GREEN_PIN, False)
-            set_led(PA_YELLOW_PIN, True)
-            pa_od_sub = 1
-            pa_od_sub_t = t
-            print("[AUTO] ODJETO: YELLOW")
-    elif pa_od_sub == 1:
-        # YELLOW sviti, pak prepnout na RED
-        if (t - pa_od_sub_t) >= PA_OD_YELLOW_S:
-            set_led(PA_YELLOW_PIN, False)
-            set_led(PA_RED_PIN, True)
-            pa_od_sub = 2
-            pa_action_done = True
-            pa_action_done_t = t
-            print("[AUTO] ODJETO: RED (action done, prodleva {:.1f} s)".format(PA_TRANSITION_S["ODJETO"]))
-
-
-def _pa_enter_end(t):
-    global pa_phase, pa_active
-    pa_phase = "END"
-    _pa_clear_semafor()
-    _pa_clear_onewire()
-    pa_active = False
-    # END -> vabeniKoristi se zapne s prodlevou (dle zadani ~4 s)
-    vabeni_arm_now(t + VABENI_POST_AUTO_DELAY_S)
-    print("[AUTO] END - PustAuto dokonceno, vabeniKoristi za {:.1f} s".format(
-        VABENI_POST_AUTO_DELAY_S))
-
-
-def pustauto_start():
-    global pa_active
-    if pa_active:
         return
-    pa_active = True
-    vabeni_stop()                       # vabeniKoristi se deaktivuje pri startu PustAuto
-    _pa_enter_init(time.monotonic())
 
-
-def pustauto_off():
-    """Hard stop (napr. interrupt z REPL; SW4 je momentova, neresetuje normalne)."""
-    global pa_active, pa_phase
-    if not pa_active and pa_phase != "END":
+    if sem_state == SEM_ODJETO:
+        # zelena -> zluta -> cervena, pak konec
+        if sem_sub == 0:
+            # zelena dosviti
+            if (t - sem_sub_t) >= SEM_ODJETO_GREEN_HOLD_S:
+                set_led(SEMAFOR_GREEN, False)
+                set_led(SEMAFOR_YELLOW, True)
+                sem_sub = 1
+                sem_sub_t = t
+        elif sem_sub == 1:
+            # zluta
+            if (t - sem_sub_t) >= SEM_ODJETO_YELLOW_S:
+                set_led(SEMAFOR_YELLOW, False)
+                set_led(SEMAFOR_RED, True)
+                sem_sub = 2
+                sem_sub_t = t
+        elif sem_sub == 2:
+            # cervena drz SEM_ODJETO_TO_END_S -> END
+            if (t - sem_sub_t) >= SEM_ODJETO_TO_END_S:
+                set_led(SEMAFOR_RED, False)
+                sem_state = SEM_END
+                sem_t = t
+                print("[SEMAFOR] -> END")
         return
-    pa_active = False
-    pa_phase = None
-    _pa_clear_semafor()
-    _pa_clear_onewire()
-    vabeni_arm_now(time.monotonic())    # po preruseni take obnovit vabeniKoristi
-    print("[AUTO] PustAuto preruseno (vabeniKoristi obnoveno)")
 
-
-def pustauto_tick(t):
-    """Driver fazoveho stroje. Bezi animaci aktualni faze nebo ceka na
-    prodlevu mezi fazemi, pak prejde do dalsi faze."""
-    global pa_action_done
-    if not pa_active:
+    if sem_state == SEM_END:
+        # vse zhasnuto. naplanuj vabeniKoristi (zadani: prodleni asi 4 s)
+        onewire_off()
+        sem_state = SEM_IDLE
+        vabeni_schedule(4.0)
+        print("[SEMAFOR] DONE")
         return
-    # 1) bezi animace faze?
-    if not pa_action_done:
-        if pa_phase == "RUN_SEM":
-            _pa_tick_run_sem(t)
-        elif pa_phase == "GO":
-            _pa_tick_go(t)
-        elif pa_phase == "ODJETO":
-            _pa_tick_odjeto(t)
-        # INIT je staticky (pa_action_done = True hned po enter)
-        return
-    # 2) akce hotova, cekame prodlevu, pak prechod
-    transition = PA_TRANSITION_S.get(pa_phase, 0.0)
-    if (t - pa_action_done_t) < transition:
-        return
-    # prechod do dalsi faze
-    if pa_phase == "INIT":
-        _pa_enter_run_sem(t)
-    elif pa_phase == "RUN_SEM":
-        _pa_enter_go(t)
-    elif pa_phase == "GO":
-        _pa_enter_odjeto(t)
-    elif pa_phase == "ODJETO":
-        _pa_enter_end(t)
-    # END -> nic, pa_active je False
 
 
-# --- MajakBuldozer (SWITCH 1 / REPL 'B') -------------------------------------
-# Pulzovani jako majak stavebniho auta: pomale stoupani 0->MAX, kratky vrchol,
-# pomaly pokles zpet na 0. Realizovano fci sin(pi*phase)^N: vyssi N = uzsi
-# vrchol a delsi "tmavy" cas v periode.
-# Vrchol je PWM_MAX_PCT[BULDOZER_LED_PIN] (= 65 % dle tabulky).
-BULDOZER_LED_PIN = 7
-BULDOZER_PERIOD_S = 2.0       # delka jedne periody pulzu
-BULDOZER_SHARPNESS = 6        # N v sin^N - vyssi = uzsi peak (rozumne 4..10)
-
-bul_active = False
-bul_start = 0.0
-
-
-def buldozer_start():
-    global bul_active, bul_start
-    if bul_active:
-        print("[BULDOZER] uz pulzuje")
-        return
-    bul_active = True
-    bul_start = time.monotonic()
-    led_on[BULDOZER_LED_PIN] = True   # apply_led pak ridi viditelnou intenzitu pres duty
-    print("[BULDOZER] MajakBuldozer ZAPNUTO (perioda {:.1f} s, peak {} %)".format(
-        BULDOZER_PERIOD_S, PWM_MAX_PCT[BULDOZER_LED_PIN]))
-
-
-def buldozer_off():
-    global bul_active
-    if not bul_active:
-        return
-    bul_active = False
-    led_duty_pct[BULDOZER_LED_PIN] = PWM_MAX_PCT[BULDOZER_LED_PIN]  # vrat default
-    set_led(BULDOZER_LED_PIN, False)
-    print("[BULDOZER] MajakBuldozer VYPNUTO")
-
-
-def buldozer_tick(t):
-    """Spocte aktualni duty pro BULDOZER LED a zapise jen kdyz se zmenila."""
-    if not bul_active:
-        return
-    phase = ((t - bul_start) % BULDOZER_PERIOD_S) / BULDOZER_PERIOD_S  # 0..1
-    shape = math.sin(math.pi * phase) ** BULDOZER_SHARPNESS             # 0..1, uzky peak v 0.5
-    peak = PWM_MAX_PCT[BULDOZER_LED_PIN]
-    new_pct = int(round(shape * peak))
-    if new_pct != led_duty_pct[BULDOZER_LED_PIN]:
-        led_duty_pct[BULDOZER_LED_PIN] = new_pct
-        apply_led(BULDOZER_LED_PIN)
-
-
-# --- PozorStavba (auto, bezi od bootu) ---------------------------------------
-# Bliknuti dvou cervenych LED ve skupine POZOR (GPIO 5, 6) tak, aby alternovaly
-# - klasicky stavebni "varovny" semafor. Pulperioda = POZOR_HALF_PERIOD_S.
-# Pauza: manualni toggle 5 nebo 6 z REPL pozastavi blikani (uzivatel chce
-# kontrolovat stav). REPL 'X' znovu zapne.
-pozor_running = True       # vychozi stav po bootu
-pozor_paused = False
-pozor_phase = 0            # 0 -> sviti pin 5, 1 -> sviti pin 6
-pozor_last_t = 0.0
-
-
-def pozor_pause(reason=""):
-    global pozor_paused
-    if pozor_paused:
-        return
-    pozor_paused = True
-    extra = " ({})".format(reason) if reason else ""
-    print("[POZOR] PozorStavba PAUZA{} - obnoveni: 'X'".format(extra))
-
-
-def pozor_resume():
-    global pozor_paused, pozor_last_t, pozor_phase
-    if not pozor_paused and pozor_running:
-        print("[POZOR] PozorStavba uz bezi")
-        return
-    pozor_paused = False
-    pozor_last_t = time.monotonic()
-    pozor_phase = 0
-    set_led(POZOR_PINS[0], True)
-    set_led(POZOR_PINS[1], False)
-    print("[POZOR] PozorStavba ZAPNUTO")
-
-
-def pozor_tick(t):
-    global pozor_phase, pozor_last_t
-    if not pozor_running or pozor_paused:
-        return
-    if (t - pozor_last_t) >= POZOR_HALF_PERIOD_S:
-        pozor_phase = 1 - pozor_phase
-        if pozor_phase == 0:
-            set_led(POZOR_PINS[1], False)
-            set_led(POZOR_PINS[0], True)
-        else:
-            set_led(POZOR_PINS[0], False)
-            set_led(POZOR_PINS[1], True)
-        pozor_last_t = t
-
-
-# --- RozsvitStavbu (SWITCH 3) ------------------------------------------------
-# Triviální: rozsviti STAVBA (GPIO 12) + MICHACKA (GPIO 8) zaroven.
-def stavba_on():
-    set_led(STAVBA_LED_PIN, True)
-    set_led(MICHACKA_LED_PIN, True)
-    print("[STAVBA] RozsvitStavbu ZAPNUTO (GPIO {} + {})".format(STAVBA_LED_PIN, MICHACKA_LED_PIN))
-
-
-def stavba_off():
-    set_led(STAVBA_LED_PIN, False)
-    set_led(MICHACKA_LED_PIN, False)
-    print("[STAVBA] RozsvitStavbu VYPNUTO")
-
-
-# --- vabeniKoristi (TLACITKO, GPIO 11) ---------------------------------------
-# Svetlo pro TLACITKO pulzuje, aby pritahlo pozornost. Spousti se asi 5 s po
-# nabehnuti programu HRA. Pri startu PustAuto se vypne, po END fazi PustAuto
-# se znovu zapne (s nulovou prodlevou - okamzite).
-# Pulzni profil: smooth sin(pi*phase)^2 - jemne pulzuje 0 -> MAX -> 0.
-vabeni_active = False           # True = prave pulzuje
-vabeni_should_run = True        # True = bude se spoustet po uplynuti delay
-vabeni_next_start_t = 0.0       # cas kdy ma zacit pulzovat (auto-start logika)
-vabeni_pulse_start_t = 0.0      # cas startu aktualniho pulzovani
-
-
-def vabeni_arm_now(t):
-    """Naplanuje vabeni na okamzite zapnuti (po END PustAuto)."""
-    global vabeni_should_run, vabeni_next_start_t
-    vabeni_should_run = True
-    vabeni_next_start_t = t
-
-
-def vabeni_arm_boot(t):
-    """Naplanuje vabeni na zapnuti za VABENI_BOOT_DELAY_S (po startu HRA)."""
-    global vabeni_should_run, vabeni_next_start_t
-    vabeni_should_run = True
-    vabeni_next_start_t = t + VABENI_BOOT_DELAY_S
-
-
-def vabeni_start(t):
-    global vabeni_active, vabeni_pulse_start_t
-    if vabeni_active:
-        return
-    vabeni_active = True
-    vabeni_pulse_start_t = t
-    led_on[VABENI_LED_PIN] = True   # apply_led pak ridi viditelnou intenzitu pres duty
-    print("[VABENI] vabeniKoristi START (GPIO {}, max {} %)".format(
-        VABENI_LED_PIN, VABENI_MAX_PCT))
-
-
-def vabeni_stop():
-    """Vypne pulzovani a oznaci ze se nema spustit (dokud nekdo nevola vabeni_arm_*)."""
-    global vabeni_active, vabeni_should_run
-    vabeni_active = False
-    vabeni_should_run = False
-    led_duty_pct[VABENI_LED_PIN] = PWM_MAX_PCT[VABENI_LED_PIN]   # vrat default
-    set_led(VABENI_LED_PIN, False)
-    print("[VABENI] vabeniKoristi STOP")
-
-
-def vabeni_tick(t):
-    """Auto-start po prodleve + pulzni animace."""
-    global vabeni_active, vabeni_pulse_start_t
-    # 1) auto-start po prodleve
-    if not vabeni_active and vabeni_should_run and t >= vabeni_next_start_t:
-        vabeni_start(t)
-    # 2) pulzni animace
-    if not vabeni_active:
-        return
-    phase = ((t - vabeni_pulse_start_t) % VABENI_PERIOD_S) / VABENI_PERIOD_S  # 0..1
-    shape = math.sin(math.pi * phase) ** 2                                    # 0..1, smooth
-    new_pct = int(round(shape * VABENI_MAX_PCT))
-    if new_pct != led_duty_pct[VABENI_LED_PIN]:
-        led_duty_pct[VABENI_LED_PIN] = new_pct
-        apply_led(VABENI_LED_PIN)
-
-
-# --- sleepBox / ShutDown (System sekce v zadani) -----------------------------
-# sleepBox: po SLEEP_BOX_TIMEOUT_S necinnosti fyzickych vstupu (GPIO 18-22)
-#           vypne vsechny vystupy a zastavi HRA. Keep-alive bezi dal. REPL
-#           se do necinnosti nezapocitava.
-# ShutDown: po SHUTDOWN_TIMEOUT_S v rezimu sleepBox vypne keep-alive trvale -
-#           HW odrizne napajeni a system koncti (smrt, navrat jen pres boot).
-sleepbox_active = False
-sleepbox_entered_t = 0.0      # cas vstupu do sleepBox (pro ShutDown timer)
-last_input_t = 0.0            # cas posledni zmeny fyzickeho vstupu
-
-
-def notify_input_activity(t):
-    """Vola se pri kazde debounced zmene fyzickeho switche.
-    Resetuje sleepBox timer; pokud sleepBox aktivni, probudi system."""
-    global last_input_t
-    last_input_t = t
-    if sleepbox_active:
-        sleepbox_exit(t)
-
-
-def sleepbox_enter(t):
-    """Vstup do sleepBox: vypne vsechny vystupy + zastavi HRA. KA bezi dal."""
-    global sleepbox_active, sleepbox_entered_t, pozor_running
-    if sleepbox_active:
-        return
-    sleepbox_active = True
-    sleepbox_entered_t = t
-    # zastav vsechny HRA funkce
-    buldozer_off()
-    jerab_off()
-    stavba_off()
-    pustauto_off()
-    vabeni_stop()
-    pozor_running = False
-    # zhasit vsechny LED (PWM 0-15 + OneWire pasek)
-    for n in LED_PINS:
-        set_led(n, False)
-    onewire.fill((0, 0, 0))
-    onewire.show()
-    print("[SLEEP] sleepBox AKTIVOVAN (vse OFF, KA bezi dal, ShutDown za {:.0f} s)".format(
-        SHUTDOWN_TIMEOUT_S))
-
-
-def sleepbox_exit(t):
-    """Probuzeni ze sleepBox - HRA do defaultniho stavu."""
-    global sleepbox_active, pozor_running, pozor_paused, pozor_last_t, pozor_phase
-    if not sleepbox_active:
-        return
-    sleepbox_active = False
-    # default HRA stav: PozorStavba bezi, vabeniKoristi naplanovany za VABENI_BOOT_DELAY_S
-    pozor_running = True
-    pozor_paused = False
-    pozor_last_t = t
-    pozor_phase = 0
-    set_led(POZOR_PINS[0], True)
-    set_led(POZOR_PINS[1], False)
-    vabeni_arm_boot(t)
-    print("[SLEEP] sleepBox DEAKTIVOVAN - HRA v default stavu (PozorStavba + vabeni za {:.0f} s)".format(
-        VABENI_BOOT_DELAY_S))
-
-
-def sleepbox_tick(t):
-    """Sleduje necinnost vstupu, po timeoutu vstoupi do sleepBox."""
-    if sleepbox_active:
-        return
-    if (t - last_input_t) >= SLEEP_BOX_TIMEOUT_S:
-        sleepbox_enter(t)
-
-
-def shutdown_tick(t):
-    """V sleepBox: po SHUTDOWN_TIMEOUT_S vypne keep-alive a ukonci system."""
-    if not sleepbox_active:
-        return
-    if (t - sleepbox_entered_t) >= SHUTDOWN_TIMEOUT_S:
-        shutdown_now()
-
-
-def shutdown_now():
-    """Trvale vypnuti: KA OFF -> HW odrizne napajeni. Pokud lze, deep sleep."""
-    keep_alive_off()
-    debug_led.value = False
-    print("=" * 50)
-    print("[SHUTDOWN] SHUTDOWN_TIMEOUT_S vyprsel - keep-alive OFF, system konci")
-    print("=" * 50)
-    # Pokus o deep sleep - sniz spotrebu nez HW odrizne napajeni.
-    # Pokud alarm modul neni dostupny (CircuitPython build), busy-wait do odpojeni.
-    try:
-        import alarm
-        alarm.exit_and_deep_sleep_until_alarms()
-    except Exception as e:
-        print("[SHUTDOWN] deep sleep nedostupny ({}), busy-wait dokud HW neodpoji napajeni".format(e))
-    while True:
-        time.sleep(1.0)
-
-
-# --- Vsechny LED ON/OFF (sdileno mezi 'A'/'Z' a SWITCH 4) ---
+# ---- Vsechny LED ON (SW5, prikaz A v REPL) ----
 def all_leds_on():
     for n in LED_PINS:
         if n in EXCLUSIVE_PAIR:
-            continue  # tyhle ridi alt_tick
+            continue
         set_led(n, True)
     alt_start_now()
-    print("[LED] vsechny ON (GPIO {}/{} alternuji s periodou {:.1f} s)".format(
-        EXCLUSIVE_PAIR[0], EXCLUSIVE_PAIR[1], ALT_PERIOD_S))
+    print("[LED] vsechny ON (GPIO 0/1 alternuji {} s)".format(ALT_PERIOD_S))
 
 
 def all_leds_off():
@@ -1045,93 +979,89 @@ def all_leds_off():
     print("[LED] vsechny OFF")
 
 
-# --- 1-wire LED setup (GP17, 12x WS2812 / Inolux IN-PI55) ---
-ONEWIRE_BRIGHTNESS = 0.08    # 8 % (dle tabulky LED, AUTO RGB)
-print("[INIT] inicializace 1-wire LED ({}x WS2812 na GPIO {})...".format(N_ONEWIRE_PIXELS, ONEWIRE_PIN))
-# pixel_order=GRB je default WS2812 - Inolux IN-PI55 ma stejne poradi
-onewire = neopixel.NeoPixel(
-    gp(ONEWIRE_PIN), N_ONEWIRE_PIXELS,
-    brightness=ONEWIRE_BRIGHTNESS, auto_write=False, pixel_order=neopixel.GRB,
-)
-onewire.fill((0, 0, 0))
-onewire.show()
-print("[INIT]   1-wire LED zhasnuty (brightness={}, pixel_order=GRB).".format(ONEWIRE_BRIGHTNESS))
+# ====================================================================
+# SleepBox + ShutDown
+# ====================================================================
+last_input_change_t = time.monotonic()
+sleepbox_active = False
+sleepbox_entered_t = 0.0
 
 
-def onewire_smoke_test():
-    """RGB diagnosticky test - rozsviti cely retez R, G, B postupne, kazdou barvu 1 s.
-    - kdyz nic nesviti: HW (napajeni, datalinka, prvni pixel mrtvy)
-    - kdyz sviti spatne barvy: pixel_order (GRB vs RGB vs BRG vs ...)
-    - kdyz se zastavi po N pixelech: vadny N+1 pixel nebo spojeni za nim
-    """
-    print("[1WIRE] smoke test - RED celym retezem na 1 s...")
-    onewire.fill((255, 0, 0))
-    onewire.show()
-    time.sleep(1.0)
-    print("[1WIRE] smoke test - GREEN celym retezem na 1 s...")
-    onewire.fill((0, 255, 0))
-    onewire.show()
-    time.sleep(1.0)
-    print("[1WIRE] smoke test - BLUE celym retezem na 1 s...")
-    onewire.fill((0, 0, 255))
-    onewire.show()
-    time.sleep(1.0)
-    onewire.fill((0, 0, 0))
-    onewire.show()
+def stop_all_hra():
+    """Zastavi vsechny HRA funkce (krome systemoveho keep-alive)."""
+    if majak_active:
+        majak_stop()
+    if jerab_active:
+        jerab_stop()
+    if stavba_phase != "idle":
+        stavba_force_off()   # sleepBox = okamzite, ne fade-out
+    if sem_state != SEM_IDLE:
+        sem_abort()
+    if vabeni_active or vabeni_scheduled_at is not None:
+        vabeni_stop()
+    if pozor_active:
+        pozor_stop()
+    if alt_mode:
+        alt_stop()
+    buzzer_silence()
+    # vypni vsechny LED (PWM 0..15 + OneWire)
+    for n in LED_PINS:
+        set_led(n, False)
+    onewire_off()
 
 
-def onewire_sequence_test(color=(0, 255, 0), step_s=0.4):
-    """Postupne rozsviceni a zhasnuti pixel po pixelu - dle zadani."""
-    onewire.fill((0, 0, 0))
-    onewire.show()
-    for i in range(N_ONEWIRE_PIXELS):
-        onewire[i] = color
-        onewire.show()
-        print("[1WIRE]   pixel {:2d} ON  {}".format(i, color))
-        time.sleep(step_s)
-    time.sleep(step_s)
-    for i in range(N_ONEWIRE_PIXELS):
-        onewire[i] = (0, 0, 0)
-        onewire.show()
-        print("[1WIRE]   pixel {:2d} OFF".format(i))
-        time.sleep(step_s)
+def sleepbox_enter():
+    global sleepbox_active, sleepbox_entered_t
+    if sleepbox_active:
+        return
+    sleepbox_active = True
+    sleepbox_entered_t = time.monotonic()
+    stop_all_hra()
+    print("[SLEEPBOX] aktivovano (vstupy {:.0f}s neaktivni). ShutDown za {:.0f}s.".format(
+        SLEEP_BOX_TIMEOUT_S, SHUTDOWN_TIMEOUT_S))
 
 
-def onewire_chase(color=(0, 255, 0), step_s=0.04):
-    """Bezici pixel: rozsviti dalsi a zaroven zhasne predchozi (jen 1 sviti)."""
-    onewire.fill((0, 0, 0))
-    onewire.show()
-    for i in range(N_ONEWIRE_PIXELS):
-        onewire[i] = color
-        if i > 0:
-            onewire[i - 1] = (0, 0, 0)
-        onewire.show()           # oba zapis projdou v jednom snimku
-        print("[1WIRE]   pixel {:2d} {}".format(i, color))
-        time.sleep(step_s)
-    # zhasni i posledni
-    onewire[N_ONEWIRE_PIXELS - 1] = (0, 0, 0)
-    onewire.show()
+def sleepbox_exit():
+    global sleepbox_active, last_input_change_t
+    if not sleepbox_active:
+        return
+    sleepbox_active = False
+    last_input_change_t = time.monotonic()
+    # HRA do defaultniho stavu: PozorStavba znovu + vabeniKoristi naplanovat
+    pozor_start()
+    vabeni_schedule(VABENI_BOOT_DELAY_S)
+    print("[SLEEPBOX] deaktivovano. HRA reset na defaulty.")
 
 
-# --- Init test: probliknuti LED po skupinach, v ramci skupiny LED po LED ---
-LED_TEST_ON_S = 0.1     # doba sviceni jedne LED v init testu
+def shutdown_now():
+    print("[SHUTDOWN] casovac vyprsel, vypinam keep-alive. System se vypne.")
+    keep_alive_off()
+    # po vypnuti keep-alive zustaneme v idle smycce - ext. HW odrizne napajeni
+    while True:
+        time.sleep(1.0)
 
+
+# ====================================================================
+# Init test LED po skupinach (vc. OneWire)
+# ====================================================================
 print("[INIT] Test LED po skupinach (LED po LED)...")
-time.sleep(0.5)  # kratka pauza, at je videt cisty start
-for name, pins in LED_GROUPS:
+time.sleep(0.3)
+for name, pins in LED_GROUPS_INIT:
     print("[INIT]   skupina {:8s} -> GPIO {}".format(name, list(pins)))
     for n in pins:
         set_led(n, True)
         time.sleep(LED_TEST_ON_S)
         set_led(n, False)
-print("[INIT] Test LED hotov - vsechny LED OFF.")
+print("[INIT] Test PWM LED hotov.")
 
-print("[INIT] Test 1-wire LED - bezici pixel zelenou...")
-onewire_chase(color=(0, 255, 0), step_s=0.04)
+print("[INIT] Test 1-wire LED - sekvence (zelena, pixel po pixelu, rozsvit+zhasnout)...")
+onewire_seq_test(color=(0, 255, 0), step_s=0.15)
 print("[INIT] Test 1-wire LED hotov.")
 
 
-# --- Input setup ---
+# ====================================================================
+# Inputs (debounced)
+# ====================================================================
 print("[INIT] konfigurace vstupu GPIO {} (Pull-UP, aktivni LOW)...".format(INPUT_PINS))
 inputs = {}
 raw_state = {}
@@ -1146,254 +1076,272 @@ for n in INPUT_PINS:
     raw_state[n] = v
     raw_changed_at[n] = 0.0
     confirmed[n] = v
-print("[INIT]   vstupy pripraveny. Aktualni stav: {}".format(
+print("[INIT]   vstupy pripraveny: {}".format(
     {n: ("HIGH" if confirmed[n] else "LOW") for n in INPUT_PINS}))
 
-# Keep-alive je dle zadani sekce "System" automaticky zapnuty na pozadi.
-print("[INIT] zapinam keep-alive natvrdo (HRA mode - bezi na pozadi)")
-keep_alive_on()
 
-# PozorStavba se spousti automaticky po bootu (zadani sekce "Pozor Stavba").
-print("[INIT] spoustim PozorStavba (alternujici 5/6, perioda {} ms)".format(int(POZOR_HALF_PERIOD_S * 2 * 1000)))
-pozor_last_t = time.monotonic()
-set_led(POZOR_PINS[0], True)   # zacni RED LEFT svitici, RIGHT zhasnutou
-set_led(POZOR_PINS[1], False)
+# ====================================================================
+# REPL parser (Enter-confirmed, echo, backspace)
+# ====================================================================
+input_buffer = ""
 
-# vabeniKoristi - naplanuj auto-start 5 s po startu HRA (zde je start HRA).
-vabeni_arm_boot(time.monotonic())
-print("[INIT] vabeniKoristi armed - start za {} s (GPIO {}, max {} %)".format(
-    VABENI_BOOT_DELAY_S, VABENI_LED_PIN, VABENI_MAX_PCT))
 
-# sleepBox timer - resetuj na start HRA (necinnost se pocita az od ted).
-last_input_t = time.monotonic()
-print("[INIT] sleepBox timer armed (timeout {:.0f} s, pak ShutDown za dalsich {:.0f} s)".format(
-    SLEEP_BOX_TIMEOUT_S, SHUTDOWN_TIMEOUT_S))
+def echo(s):
+    # print s end="" je v CP spolehlivejsi flush nez sys.stdout.write
+    print(s, end="")
 
-# Switche srovnane podle fyzicke polohy (aktivni LOW).
-if confirmed[SW1_BULDOZER_PIN] is False:
-    print("[INIT]   SWITCH 1 sepnut -> spoustim MajakBuldozer")
-    buldozer_start()
-if confirmed[SW2_JERAB_PIN] is False:
-    print("[INIT]   SWITCH 2 sepnut -> spoustim RozsvitJerab")
-    jerab_on()
-if confirmed[SW3_STAVBA_PIN] is False:
-    print("[INIT]   SWITCH 3 sepnut -> spoustim RozsvitStavbu")
-    stavba_on()
-if confirmed[SW4_AUTO_PIN] is False:
-    # SW4 je momentova - pokud je pri bootu sepnuta, spustime PustAuto a uz neresetujeme
-    print("[INIT]   SWITCH 4 sepnut (momentova) -> spoustim PustAuto")
-    pustauto_start()
-if confirmed[SW5_ALL_PIN] is False:
-    print("[INIT]   SWITCH 5 sepnut -> zapinam vsechny LED")
-    all_leds_on()
+
+def echo_backspace():
+    print("\b \b", end="")
 
 
 def print_help():
-    print("-" * 50)
-    print("Prikazy (jednim znakem, bez Enteru):")
-    print("  0..9 a..f  -> toggle LED GPIO 0..15 (hex)")
-    print("                (toggle 5/6 pauzuje PozorStavba, obnoveni 'X')")
-    print("  A          -> vsechny LED ON (GPIO {}/{} alternuji {:.1f}s)".format(
-        EXCLUSIVE_PAIR[0], EXCLUSIVE_PAIR[1], ALT_PERIOD_S))
-    print("  Z          -> vsechny LED OFF")
-    print("  S          -> stav LED (vypis svitici)")
-    print("  W          -> zapnout keep-alive signal")
-    print("  Woff       -> vypnout keep-alive signal")
-    print("  N          -> opakovat 1-wire LED test (R/G/B + sekvence)")
-    print("  B          -> toggle MajakBuldozer (GPIO {}, peak {}%)".format(
-        BULDOZER_LED_PIN, PWM_MAX_PCT[BULDOZER_LED_PIN]))
-    print("  X          -> obnovit PozorStavba (po manualnim toggle 5/6)")
-    print("  D<n>       -> PWM duty 0..100 % pro VSECHNY LED  (napr. D50, ukonci Enter)")
-    print("                kazda LED clamped na sve PWM_MAX (viz 'P' / tabulka)")
-    print("  P<hex>=<n> -> PWM duty pro JEDNU LED + zapnout  (napr. Pa=30)")
-    print("                clamped na PWM_MAX_PCT[n] z tabulky")
-    print("  + / -      -> +/- {} % duty na posledni LED z 'P'  (bez Enteru)".format(DUTY_STEP_PCT))
-    print("  P          -> vypis duty + PWM_MAX vsech LED")
-    print("  F<n>       -> PWM freq v Hz      (napr. F1000, ukonci Enter)")
-    print("                rozsah {}..{} Hz (frekvence je sdilena vsemi LED)".format(PWM_FREQ_MIN, PWM_FREQ_MAX))
-    print("  ?          -> tato napoveda")
-    print("HRA - mapovani switchu:")
-    print("  SW1 (GPIO {})  MajakBuldozer".format(SW1_BULDOZER_PIN))
-    print("  SW2 (GPIO {})  RozsvitJerab".format(SW2_JERAB_PIN))
-    print("  SW3 (GPIO {})  RozsvitStavbu".format(SW3_STAVBA_PIN))
-    print("  SW4 (GPIO {})  PustAuto (momentova, dobehne)".format(SW4_AUTO_PIN))
-    print("  SW5 (GPIO {})  vsechny LED".format(SW5_ALL_PIN))
-    print("Auto na pozadi:")
-    print("  PozorStavba (GPIO {}/{} alternuji)".format(POZOR_PINS[0], POZOR_PINS[1]))
-    print("  vabeniKoristi (GPIO {}, pulzuje, vyp behem PustAuto)".format(VABENI_LED_PIN))
-    print("Aktualni PWM: freq={} Hz  (per-LED duty - viz 'P' nebo 'S')".format(pwm_freq))
-    print("-" * 50)
+    print("-" * 60)
+    print("HYBRIDNI REPL:")
+    print("  INSTANT (bez Enteru, vyhodnoceni hned po stisknuti):")
+    print("    0..9 a..f -> toggle LED GPIO 0..15 (hex)")
+    print("    A         -> vsechny LED ON (GPIO 0/1 alternuji {} s)".format(ALT_PERIOD_S))
+    print("    Z         -> vsechny LED OFF")
+    print("    S         -> vypis svitici LED")
+    print("    N         -> opakovat 1-wire LED test")
+    print("    B         -> toggle MajakBuldozer")
+    print("    X         -> obnovit PozorStavba (po manualnim toggle 5/6)")
+    print("    + / -     -> +-5 % na posledni LED z 'P<hex>=<n>'")
+    print("    ?         -> tato napoveda")
+    print("  BUFFER + ENTER (mezera/tab/Enter potvrdi):")
+    print("    W            -> zapnout keep-alive")
+    print("    Woff         -> vypnout keep-alive")
+    print("    D            -> vypis duty vsech LED")
+    print("    D<n>         -> duty 0..100 % pro VSECHNY LED (clamp na MAX)")
+    print("    F            -> vypis aktualni PWM freq")
+    print("    F<n>         -> nastav PWM freq v Hz")
+    print("    P            -> vypis duty + PWM_MAX per LED")
+    print("    P<hex>=<n>   -> duty pro jednu LED a zapnout (napr. Pa=30)")
+    print("    FactoryRESET -> default hodnoty (z LED-Table) + NVM")
+    print("Aktualne: freq={} Hz, ka_enabled={}".format(pwm_freq, ka_enabled))
+    print("-" * 60)
 
 
-def handle_token(tok):
-    """Obslouzi 1- nebo viceznakovy token (Woff)."""
-    if tok == "":
+last_p_target = None  # posledni LED nastavena prikazem P<hex>=<n>
+
+
+def handle_command(cmd):
+    """Vyhodnoti jeden cely radek - po Enteru."""
+    global last_p_target
+    cmd = cmd.strip()
+    if not cmd:
         return
-    if len(tok) == 1:
-        ch = tok
+
+    # FactoryRESET (case-sensitive)
+    if cmd == "FactoryRESET":
+        factory_reset()
+        return
+
+    # Vse ostatni - cmd je krátky token. Pokud jeden znak:
+    if len(cmd) == 1:
+        ch = cmd
         if ch in HEX_DIGITS:
             n = int(ch, 16)
             if n in EXCLUSIVE_PAIR and alt_mode:
                 alt_stop()
                 print("[LED] alternovani GPIO {}/{} ukonceno (manualni toggle)".format(*EXCLUSIVE_PAIR))
-            # Manualni toggle LED ve skupine POZOR pauzuje PozorStavba
-            if n in POZOR_PINS and pozor_running and not pozor_paused:
-                pozor_pause("manualni toggle GPIO {}".format(n))
             set_led(n, not led_on[n])
             print("[LED] GPIO {:2d} = {}".format(n, "ON " if led_on[n] else "OFF"))
+            # manualni toggle LED 5/6 pauzuje PozorStavba
+            if n in POZOR_PINS:
+                pozor_pause()
+                print("[POZOR] pauzovano kvuli manualnimu toggle (obnov: X)")
             return
         if ch == "A":
-            all_leds_on()
-            return
+            all_leds_on(); return
         if ch == "Z":
-            all_leds_off()
-            return
+            all_leds_off(); return
         if ch == "S":
             svici = [n for n in LED_PINS if led_on[n]]
-            if svici:
-                print("[LED] svici GPIO:")
-                for n in svici:
-                    print("       GPIO {:2d} @ {:3d}%".format(n, led_duty_pct[n]))
-            else:
-                print("[LED] zadne LED nesviti")
-            return
+            print("[LED] svici GPIO: {}".format(svici)); return
         if ch == "?":
-            print_help()
-            return
+            print_help(); return
         if ch == "W":
-            keep_alive_on()
-            return
+            keep_alive_on(); return
         if ch == "N":
-            print("[1WIRE] manualni test 1-wire LED...")
             onewire_smoke_test()
-            onewire_sequence_test(color=(0, 255, 0), step_s=0.4)
-            print("[1WIRE] hotovo.")
+            onewire_seq_test(color=(0, 255, 0), step_s=0.15)
             return
         if ch == "B":
-            if bul_active:
-                buldozer_off()
-            else:
-                buldozer_start()
-            return
+            majak_toggle(); return
         if ch == "X":
-            pozor_resume()
+            pozor_resume(); return
+        if ch == "D":
+            print("[PWM] duty per LED: {}".format(led_duty_pct)); return
+        if ch == "P":
+            print("[PWM] per LED (duty / MAX):")
+            for n in LED_PINS:
+                print("  GPIO {:2d}: {:3d} % / MAX {:3d} %".format(n, led_duty_pct[n], PWM_MAX_PCT[n]))
             return
+        if ch == "F":
+            print("[PWM] frequency = {} Hz".format(pwm_freq)); return
         if ch == "+":
-            nudge_last_led(+DUTY_STEP_PCT)
+            if last_p_target is None:
+                print("[PWM] + krok: nejdriv pouzij P<hex>=<n>")
+                return
+            set_led_duty(last_p_target, led_duty_pct[last_p_target] + 5)
             return
         if ch == "-":
-            nudge_last_led(-DUTY_STEP_PCT)
+            if last_p_target is None:
+                print("[PWM] - krok: nejdriv pouzij P<hex>=<n>")
+                return
+            set_led_duty(last_p_target, led_duty_pct[last_p_target] - 5)
             return
-        print("[!] neznamy znak: {!r}  (? = napoveda)".format(ch))
+        print("[!] neznamy znak: {!r}".format(ch))
         return
-    if tok == "Woff":
-        keep_alive_off()
-        return
-    if tok == "D":
-        duties = [led_duty_pct[n] for n in LED_PINS]
-        if min(duties) == max(duties):
-            print("[PWM] vsechny LED duty = {}%".format(duties[0]))
-        else:
-            print("[PWM] duty se lisi: min={}%, max={}%  (vypis vsech: 'P')".format(min(duties), max(duties)))
-        return
-    if tok == "F":
-        print("[PWM] aktualni frekvence = {} Hz".format(pwm_freq))
-        return
-    if tok == "P":
-        print_all_duties()
-        return
-    if tok[0] == "D" and len(tok) > 1 and tok[1:].isdigit():
-        set_pwm_duty_all(int(tok[1:]))
-        return
-    if tok[0] == "F" and len(tok) > 1 and tok[1:].isdigit():
-        set_pwm_freq(int(tok[1:]))
-        return
-    # Per-LED duty:  P<hex>=<n>   napr.  Pa=30  (LED 10 na 30 %)
-    if (tok[0] == "P" and len(tok) >= 4
-            and tok[1] in HEX_DIGITS and tok[2] == "="
-            and tok[3:].isdigit()):
-        set_led_duty(int(tok[1], 16), int(tok[3:]))
-        return
-    print("[!] neznamy prikaz: {!r}  (? = napoveda)".format(tok))
+
+    # Viceznakove prikazy
+    if cmd == "Woff":
+        keep_alive_off(); return
+
+    # D<n> - duty pro vsechny
+    if cmd[0] == "D" and cmd[1:].isdigit():
+        set_all_duty(int(cmd[1:])); return
+
+    # F<n> - frekvence
+    if cmd[0] == "F" and cmd[1:].isdigit():
+        set_pwm_freq(int(cmd[1:])); return
+
+    # P<hex>=<n> - duty pro jednu LED
+    if cmd[0] == "P" and "=" in cmd:
+        left, right = cmd[1:].split("=", 1)
+        if len(left) == 1 and left in HEX_DIGITS and right.isdigit():
+            n = int(left, 16)
+            last_p_target = n
+            set_led_duty(n, int(right))
+            return
+
+    print("[!] neznamy prikaz: {!r}".format(cmd))
 
 
-# Stav pro vstupni parser - kvuli viceznakovemu "Woff"
-input_buffer = ""
-last_char_t = 0.0
-W_TIMEOUT_S = 0.25  # po teto dobe se osamocene "W" vyhodnoti jako zapnuti KA
+REPL_DEBUG = False  # True = vypis ord() prichozich znaku (jen pro debug)
+
+# Hybridni REPL: tyto znaky se vyhodnoti hned bez Enteru
+INSTANT_CHARS = set("0123456789abcdefAZSNBX+-?")
+# Tyto znaky startuji multi-char prikaz - vstup do bufferu, ceka se na Enter
+BUFFER_START_CHARS = set("WDFP")
 
 
-def _echo(s):
-    """Echo na seriak (bez bufferingu, bez konverze \\n -> \\r\\n)."""
-    sys.stdout.write(s)
-
-
-def feed_char(ch, t):
-    """Akumuluje znaky, echuje je zpet uzivateli a vyhodnocuje.
-    Whitespace (Enter/space/tab) = flush. W, D, F, P startuji buffer mod.
-    Woff se rozezna automaticky, D/F/P cekaji na Enter. Backspace maze v bufferu."""
+def repl_feed_char(ch):
+    """Hybridni parser:
+      - prazdny buffer + INSTANT_CHARS  -> okamzite vrati ch jako 'line'
+      - prazdny buffer + BUFFER_START_CHARS -> vstup do bufferu, echo
+      - neprazdny buffer -> akumuluje az do terminatoru (Enter/space/tab)
+    """
     global input_buffer
+    if REPL_DEBUG:
+        print("[REPL-DBG] rx ord={}".format(ord(ch)))
 
-    # Enter / space / tab -> echo CRLF + flush buffer
+    # Terminator (Enter / space / tab) - flushne buffer (pokud neco je)
     if ch in ("\r", "\n", " ", "\t"):
-        _echo("\r\n")
         if input_buffer:
-            handle_token(input_buffer)
+            print("")  # newline po echo
+            line = input_buffer
             input_buffer = ""
-        return
+            return line
+        return None
 
-    # Backspace / DEL -> smaze posledni znak v bufferu a v konzoli
-    if ch in ("\x08", "\x7f"):
+    # Backspace / DEL - maze posledni znak v bufferu
+    if ch in ("\x7f", "\b"):
         if input_buffer:
             input_buffer = input_buffer[:-1]
-            _echo("\b \b")
-        return
+            echo_backspace()
+        return None
 
-    # Echo jen tisknutelnych ASCII znaku (control chars ignoruj)
-    if " " < ch <= "~":
-        _echo(ch)
-    else:
-        return
+    # Filtrace netisknutelnych znaku
+    if not (0x21 <= ord(ch) <= 0x7E):
+        return None
 
+    # Buffer mod - pokracuj v akumulaci
     if input_buffer:
         input_buffer += ch
-        if input_buffer == "Woff":
-            _echo("\r\n")
-            handle_token(input_buffer)
-            input_buffer = ""
-            return
-        if len(input_buffer) >= 12:  # bezpecnostni strop
-            _echo("\r\n")
-            handle_token(input_buffer)
-            input_buffer = ""
-        return
-    if ch in ("W", "D", "F", "P"):
+        echo(ch)
+        return None
+
+    # Prazdny buffer - rozhodni mezi instant a buffer-start
+    if ch in INSTANT_CHARS:
+        # echo s newline, hned vyhodnotit
+        print(ch)
+        return ch
+    if ch in BUFFER_START_CHARS:
         input_buffer = ch
-        return
-    # Jednoznakovy prikaz -> odradkuj pred odpovedi
-    _echo("\r\n")
-    handle_token(ch)
+        echo(ch)
+        return None
+
+    # Neznamy single-char znak
+    print("[!] neznamy znak: {!r}".format(ch))
+    return None
 
 
-print("=" * 50)
-print("EdyKostka bring-up")
-print("=" * 50)
+# ====================================================================
+# HRA - bootovaci stav: PozorStavba + naplanovani vabeniKoristi
+# ====================================================================
+print("=" * 60)
+print("EdyKostka - HRA")
+print("=" * 60)
 print_help()
 
+pozor_start()
+vabeni_schedule(VABENI_BOOT_DELAY_S)
+
+print(">>> REPL ready (hybrid: 0..9 a..f A Z S N B X +/- ? fire hned; W D F P + Enter) <<<")
+
+
+# ====================================================================
+# Switch dispatch
+# ====================================================================
+def on_switch_change(pin, pressed):
+    """pressed=True znamena hrana stisku (HIGH -> LOW)."""
+    event = "STISK" if pressed else "uvolneno"
+    print("[VSTUP] GPIO {} -> {}".format(pin, event))
+
+    if pin == SW1_PIN:
+        if pressed:
+            majak_start()
+        else:
+            majak_stop()
+    elif pin == SW2_PIN:
+        if pressed:
+            jerab_start()
+        else:
+            jerab_stop()
+    elif pin == SW3_PIN:
+        if pressed:
+            stavba_start()
+        else:
+            stavba_stop()
+    elif pin == SW4_PIN:
+        # tlacitko - jen na nabeznou hranu, dobehne dokonce.
+        # sem_start si sam zvolil jestli prehrat zvuk (jen pri uspesnem startu).
+        if pressed:
+            sem_start()
+    elif pin == SW5_PIN:
+        if pressed:
+            all_leds_on()
+        else:
+            all_leds_off()
+
+
+# ====================================================================
+# Main loop
+# ====================================================================
 while True:
     t = time.monotonic()
 
+    # --- serial input ---
     if supervisor.runtime.serial_bytes_available:
         ch = sys.stdin.read(1)
-        feed_char(ch, t)
-        last_char_t = t
-    else:
-        # Osamocene "W" bez pokracovani -> po timeoutu zapni keep-alive
-        if input_buffer == "W" and (t - last_char_t) > W_TIMEOUT_S:
-            sys.stdout.write("\r\n")
-            handle_token(input_buffer)
-            input_buffer = ""
+        line = repl_feed_char(ch)
+        if line is not None:
+            handle_command(line)
 
+    # --- inputs s debouncingem ---
+    any_input_change = False
     for n in INPUT_PINS:
         v = inputs[n].value
         if v != raw_state[n]:
@@ -1401,54 +1349,32 @@ while True:
             raw_changed_at[n] = t
         elif v != confirmed[n] and (t - raw_changed_at[n]) > DEBOUNCE_S:
             confirmed[n] = v
-            event = "STISK" if v is False else "uvolneno"
-            print("[VSTUP] GPIO {} -> {}".format(n, event))
-            # Resetuj sleepBox timer; pokud sleepBox bezi, probud system.
-            was_sleeping = sleepbox_active
-            notify_input_activity(t)
-            if was_sleeping:
-                # Probuzeni - HRA reakci na tento stisk neaplikujeme (zadani: default stav).
-                continue
-            # HRA mapovani switchu:
-            if n == SW1_BULDOZER_PIN:
-                if v is False:
-                    buldozer_start()
-                else:
-                    buldozer_off()
-            elif n == SW2_JERAB_PIN:
-                if v is False:
-                    jerab_on()
-                else:
-                    jerab_off()
-            elif n == SW3_STAVBA_PIN:
-                if v is False:
-                    stavba_on()
-                else:
-                    stavba_off()
-            elif n == SW4_AUTO_PIN:
-                # SW4 je momentova (OFF-(ON)). Stisk -> spusti PustAuto,
-                # uvolneni ignorujeme - funkce dobehne dokonce (do END faze).
-                if v is False:
-                    pustauto_start()
-                # else: pustime PustAuto bezet az do END
-            elif n == SW5_ALL_PIN:
-                if v is False:
-                    all_leds_on()
-                else:
-                    all_leds_off()
+            any_input_change = True
+            pressed = (v is False)  # aktivni LOW
+            if sleepbox_active:
+                sleepbox_exit()
+            on_switch_change(n, pressed)
+    if any_input_change:
+        last_input_change_t = t
 
-    # Keep-alive a sleep/shutdown logika bezi vzdy (i v sleepBox rezimu).
+    # --- sleepBox / ShutDown ---
+    if not sleepbox_active:
+        if (t - last_input_change_t) > SLEEP_BOX_TIMEOUT_S:
+            sleepbox_enter()
+    else:
+        if (t - sleepbox_entered_t) > SHUTDOWN_TIMEOUT_S:
+            shutdown_now()
+
+    # --- ticky ---
     keep_alive_tick(t)
-    sleepbox_tick(t)
-    shutdown_tick(t)
-
-    # HRA ticky bezi jen kdyz nejsme v sleepBox (sleepBox vse zhasl).
     if not sleepbox_active:
         alt_tick(t)
         pozor_tick(t)
-        jerab_tick(t)
-        buldozer_tick(t)
         vabeni_tick(t)
-        pustauto_tick(t)
+        majak_tick(t)
+        jerab_tick(t)
+        stavba_tick(t)
+        sem_tick(t)
+        buzzer_tick(t)
 
     time.sleep(0.005)
